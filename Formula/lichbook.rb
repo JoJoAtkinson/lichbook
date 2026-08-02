@@ -1,8 +1,8 @@
 class Lichbook < Formula
   desc "Keep a MacBook awake with the lid closed - only while plugged in and logged in"
   homepage "https://github.com/JoJoAtkinson/lichbook"
-  url "https://github.com/JoJoAtkinson/lichbook/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "5f639dd8bda610a90262f650f30db617c9a4efecb451b26dfb6e00edfed00a56"
+  url "https://github.com/JoJoAtkinson/lichbook/archive/refs/tags/v0.2.1.tar.gz"
+  sha256 "f1ce79c7887052cebe1a4313e2f3039570781b8bc1736ac7b3cecb6930156108"
   license "MIT"
 
   # The formula ships the CLI and nothing else. The menu bar app (menubar/) and
@@ -12,6 +12,19 @@ class Lichbook < Formula
   # that survives a `brew install`, so they stay build-from-source. See the repo.
   def install
     bin.install "lich"
+    # Build the menu bar app HERE, on the user's machine — an ad-hoc signature
+    # is only trusted where it was made, so a prebuilt download would be
+    # refused by Gatekeeper, while this one is born trusted. Needs only the
+    # Command Line Tools brew already requires; if swiftc is somehow absent,
+    # skip — the CLI must install regardless (fail-open, per support policy).
+    # `lich install` finds the app in this prefix and copies it to
+    # /Applications (stable path — the app registers a login item).
+    if quiet_system("/usr/bin/xcrun", "--find", "swiftc")
+      system "make", "-C", "menubar"
+      prefix.install "menubar/Lich.app"
+    else
+      opoo "swiftc not found — skipping the menu bar app build (CLI unaffected)"
+    end
   end
 
   # Why caveats instead of doing the setup here: a formula's install runs
@@ -36,7 +49,10 @@ class Lichbook < Formula
 
       Unplugging, logging out, or `lich off` ALWAYS restores normal sleep.
 
-      After `brew upgrade lichbook`, run:  lich reload
+      lich install also puts the menu bar app (💀 status + controls) in
+      /Applications, built just now on this machine.
+
+      To update everything later, one word:  lich upgrade
 
       Optional menu bar skull + Control Center toggle build from source:
         https://github.com/JoJoAtkinson/lichbook
