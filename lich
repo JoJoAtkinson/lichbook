@@ -74,6 +74,15 @@ sleep_disabled() {
 
 watcher_running() { launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; }
 
+lid_closed() { ioreg -r -k AppleClamshellState -d 1 2>/dev/null | grep -q '"AppleClamshellState" = Yes'; }
+
+console_locked() { ioreg -n Root -d1 -a 2>/dev/null | plutil -p - 2>/dev/null | grep -q '"IOConsoleLocked" => true'; }
+
+# Locking = starting the screensaver, which arms the system's own
+# "require password after screensaver/display off" setting. No accessibility
+# or automation permission needed, and it works with the lid already shut.
+lock_console() { open -a ScreenSaverEngine 2>/dev/null || true; }
+
 # ---------- watcher (runs under launchd; not meant to be called by hand) ----
 
 # The entire policy: disablesleep is 1 only when you have raised the lich AND
@@ -112,8 +121,23 @@ cmd_watch() {
   # the elegant answer but does not stream reliably under launchd (it exits
   # right after its header), and an event stream that dies quietly takes
   # disablesleep down with it. Two cheap pmset reads per tick cannot desync.
+  # Closing the lid normally locks a Mac by putting it to sleep. When lich is
+  # the reason it stays awake, macOS never fires that lock — measured, not
+  # assumed: IOConsoleLocked stays false. So the watcher restores the
+  # guarantee itself: on the tick where the lid goes shut while we hold the
+  # machine awake, lock the console. Once per closure, not continuously — so
+  # a deliberate unlock over Screen Sharing with the lid down isn't fought.
+  LID_WAS_CLOSED=0
   while :; do
     reconcile || exit $?   # broken sudoers = die loudly; launchd retries
+    if [[ "$(sleep_disabled)" == "1" ]] && lid_closed; then
+      if [[ "$LID_WAS_CLOSED" == 0 ]]; then
+        console_locked || { lock_console; log "lid closed while risen — screen locked"; }
+        LID_WAS_CLOSED=1
+      fi
+    else
+      LID_WAS_CLOSED=0
+    fi
     sleep "$POLL_INTERVAL"
   done
 }

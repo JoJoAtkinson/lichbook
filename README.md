@@ -64,6 +64,11 @@ you grant it sudo) plus one per-user LaunchAgent,
   restores `disablesleep 0` before the process dies.
 - `KeepAlive` restarts the watcher if it ever dies, and the cleanup trap
   restores normal sleep on any exit.
+- **Lid close locks the screen.** Normally the lock rides along with sleep;
+  since lich prevents the sleep, macOS never locks. The watcher detects the
+  lid closing while risen and locks the console itself (verified via
+  `IOConsoleLocked`), so an opened lid always lands on the password screen
+  while your session keeps running behind it.
 
 The risen state is just a flag file, `~/.lich/desired-state`, containing `on`
 or `off`. The CLI, the menu bar app, and the Control Center toggle all flip
