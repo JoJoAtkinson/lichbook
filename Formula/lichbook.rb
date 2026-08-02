@@ -11,13 +11,23 @@ class Lichbook < Formula
 
   def caveats
     <<~EOS
-      One-time privileged setup (scoped sudoers rule + LaunchAgent watcher):
-        lich install
-      Then raise it with:
-        lich on
-      After upgrading lichbook, restart the watcher onto the new code:
-        lich reload
-      The optional menu bar and Control Center toggles build from source:
+      First-time setup, two steps:
+
+        1. lich install    # one-time; asks for sudo ONCE to add a sudoers rule
+                           # scoped to exactly two pmset commands, plus a
+                           # per-user watcher agent
+        2. lich on         # 💀 risen: from now on, closing the lid does NOT
+                           # sleep the Mac while it's plugged in and you're
+                           # logged in
+
+      Everyday use:
+        lich               # status: risen or at rest, power, watcher health
+        lich off           # ⚰️ back to normal sleep
+      Unplugging or logging out ALWAYS restores normal sleep on its own.
+
+      After `brew upgrade lichbook`, run:  lich reload
+
+      Optional menu bar skull + Control Center toggle build from source:
         https://github.com/JoJoAtkinson/lichbook
     EOS
   end
