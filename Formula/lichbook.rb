@@ -1,8 +1,8 @@
 class Lichbook < Formula
   desc "Keep a MacBook awake with the lid closed - only while plugged in and logged in"
   homepage "https://github.com/JoJoAtkinson/lichbook"
-  url "https://github.com/JoJoAtkinson/lichbook/archive/refs/tags/v0.2.2.tar.gz"
-  sha256 "7d41bdcc3c59babb0ff0352a1ee1fab3b94e909f6c6f2c006eed5a905236ca20"
+  url "https://github.com/JoJoAtkinson/lichbook/archive/refs/tags/v0.2.3.tar.gz"
+  sha256 "4eceb81948b16cdaee778c85caaaf423211a3931f482837e5a65c640a719903f"
   license "MIT"
 
   # The formula ships the CLI and nothing else. The menu bar app (menubar/) and
@@ -25,6 +25,10 @@ class Lichbook < Formula
     else
       opoo "swiftc not found — skipping the menu bar app build (CLI unaffected)"
     end
+    # Keep the Control Center widget's sources (a few KB) so `lich widget`
+    # can build it later for users who have full Xcode. Never built here —
+    # appex targets need Xcode proper, which a formula must not require.
+    prefix.install "controlcenter"
   end
 
   # Why caveats instead of doing the setup here: a formula's install runs
@@ -52,6 +56,7 @@ class Lichbook < Formula
       lich install also puts the menu bar app (💀 status + controls) in
       /Applications, built just now on this machine.
 
+      Optional Control Center toggle (needs full Xcode):  lich widget
       To update everything later, one word:  lich upgrade
 
       Optional menu bar skull + Control Center toggle build from source:
