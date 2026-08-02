@@ -826,6 +826,62 @@ EOF
   [[ "$st_sudoers" == ok ]]
 }
 
+# ---------- Control Center widget (optional, explicit, heavyweight) ---------
+# The one component with a real toolchain requirement: appex targets cannot be
+# built with Command Line Tools alone, so this needs full Xcode plus xcodegen.
+# It is therefore never part of `lich install` — it is an explicit ask, and
+# without the toolchain it warns and does nothing rather than half-installing.
+cmd_widget() {
+  local arg="${1:-add}" self src tmpdir
+  case "$arg" in
+    remove)
+      pkill -f LichToggle 2>/dev/null || true
+      rm -rf /Applications/LichToggle.app
+      log "cmd: widget remove"
+      echo "Control Center widget removed (macOS may keep a stale gallery entry until next login)"
+      return 0
+      ;;
+    add) ;;
+    *) die "usage: lich widget [remove]" ;;
+  esac
+
+  # Toolchain gates, clearest message first, nothing touched on failure.
+  if ! /usr/bin/xcodebuild -version >/dev/null 2>&1; then
+    die "cannot add the Control Center widget without full Xcode — the Command
+      Line Tools are not enough. Install Xcode (App Store), then:
+        sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+      and re-run: lich widget"
+  fi
+  command -v xcodegen >/dev/null 2>&1 \
+    || die "cannot add the widget without xcodegen: brew install xcodegen — then re-run: lich widget"
+
+  # Sources: the brew formula keeps a copy in its prefix; a clone has them
+  # sitting next to this script.
+  self="$(/usr/bin/readlink -f "$0" 2>/dev/null || echo "$0")"
+  [[ "$self" == */Cellar/lichbook/* ]] && self="${self%%/Cellar/*}/opt/lichbook/bin/lich"
+  if [[ -d "${self%/bin/lich}/controlcenter" ]]; then
+    src="${self%/bin/lich}/controlcenter"
+  elif [[ -d "$(dirname "$self")/controlcenter" ]]; then
+    src="$(dirname "$self")/controlcenter"
+  else
+    die "widget sources not found — reinstall lichbook, or run from a clone"
+  fi
+
+  # Build in a scratch copy, never inside the brew prefix; build.sh signs
+  # ad-hoc on this machine, installs /Applications/LichToggle.app, launches it
+  # to register the extension, and prints the gallery-refresh steps.
+  tmpdir="$(mktemp -d)"
+  cp -R "$src" "$tmpdir/controlcenter"
+  echo "building the Control Center widget (a first build can take a minute)…"
+  if ( cd "$tmpdir/controlcenter" && ./build.sh ); then
+    rm -rf "$tmpdir"
+    log "cmd: widget add"
+  else
+    rm -rf "$tmpdir"
+    die "widget build failed — scroll up for the first error"
+  fi
+}
+
 cmd_upgrade() {
   # One update command for both install styles. Detect which this is from
   # where the script actually lives: brew keeps it under Cellar/opt, a clone
@@ -899,10 +955,12 @@ cmd_uninstall() {
   sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
   rm -f "$PLIST"
   rm -rf "$STATE_DIR"
-  # The menu bar app, if install put it there. The Control Center widget
-  # (LichToggle.app) is never install's to manage, so it is never removed here.
+  # The apps lich put there: the menu bar app (install step 5) and the
+  # Control Center widget (`lich widget`), if present.
   pkill -f lich-menubar 2>/dev/null || true
   rm -rf /Applications/Lich.app 2>/dev/null || true
+  pkill -f LichToggle 2>/dev/null || true
+  rm -rf /Applications/LichToggle.app 2>/dev/null || true
   sudo rm -f "$SUDOERS"
   # The PATH entry — but only if WE made it. On an Intel Mac the Homebrew
   # prefix is also /usr/local, so brew's own symlink (which points into the
@@ -941,6 +999,9 @@ usage: lich [command]     (bare `lich` = status)
   install    one-time setup, prompts for sudo once: sudoers rule scoped to
              two pmset commands, ~/.lich state flag, LaunchAgent watcher, and
              /usr/local/bin/lich unless lich is already on PATH
+  widget     build + add the optional Control Center toggle — needs full
+             Xcode and xcodegen; warns and does nothing without them
+             widget remove  take it back out
   upgrade    update lich (brew or git clone, auto-detected), refresh the
              menu bar app, and reload the watcher — the whole update, one word
   reload     restart the watcher only (upgrade runs this for you)
@@ -975,6 +1036,7 @@ case "${1:-status}" in
   config)    cmd_config "${2:-}" "${3:-}" ;;
   watch)     cmd_watch ;;
   install)   cmd_install ;;
+  widget)    cmd_widget "${2:-}" ;;
   upgrade)   cmd_upgrade ;;
   reload)    cmd_reload ;;
   uninstall) cmd_uninstall ;;

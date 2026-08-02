@@ -217,12 +217,18 @@ It registers itself as a login item on first launch (SMAppService); uncheck
 
 ## Optional: Control Center toggle
 
-macOS 26+. Requires full Xcode (not just Command Line Tools) and
-`brew install xcodegen`.
+macOS 26+, and the one piece with a heavyweight toolchain: **full Xcode**
+(Command Line Tools are not enough) plus `brew install xcodegen`. It is never
+installed unasked:
 
 ```sh
-cd controlcenter && ./build.sh
+lich widget          # builds on your machine, installs, launches
+lich widget remove   # takes it back out
 ```
+
+Without the toolchain, `lich widget` warns you exactly what's missing and
+does nothing. (From a clone, `controlcenter/build.sh` is the same build by
+hand.)
 
 Then, first time only: right-click the Desktop → "Edit Widgets…" and close it
 again (forces the control gallery to re-scan — known Tahoe quirk), then
