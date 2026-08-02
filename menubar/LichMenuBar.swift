@@ -1,7 +1,7 @@
 // LichMenuBar — a menu bar toggle for the `lich` CLI.
 //
 // Left-click the icon: toggle risen (💀) / at rest (⚰️).
-// Right-click (or option-click): status details, Start at Login, Quit.
+// Right-click (or option-click): status details, roaming, Start at Login, Quit.
 //
 // Why it exists: `lich on|off|status` is the whole product, but a docked
 // machine deserves a one-click way to raise and lay it to rest without
@@ -46,6 +46,17 @@ func lich(_ args: [String]) -> (status: Int32, output: String) {
     return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
+// Roaming — staying risen without the phylactery (i.e. on battery). The CLI
+// owns the whole feature, including the battery floor that overrules every
+// mode; this app only arms and disarms it. `lich roam status` prints exactly
+// one machine-readable line, which is the only shape parsed here.
+enum RoamMode: Equatable {
+    case off
+    case once
+    case always
+    case until(Int)   // epoch seconds
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var refreshTimer: Timer?
@@ -53,6 +64,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // `lich status --quiet` prints nothing and exits 0 when risen, non-zero
     // when at rest — the CLI's machine-readable contract for exactly this.
     var risen: Bool { lich(["status", "--quiet"]).status == 0 }
+
+    // Read live, never cached: the CLI clears roam on its own (floor breach,
+    // timer expiry, one-shot spent), so a remembered value would show stale
+    // checkmarks. Anything unexpected — a parse miss, or a `lich` too old to
+    // know the command — reads as .off, which degrades the menu to the
+    // pre-roam behaviour instead of claiming a mode that isn't armed.
+    var roamMode: RoamMode {
+        let result = lich(["roam", "status"])
+        guard result.status == 0 else { return .off }
+        let fields = result.output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: " ")
+        switch fields.first.map(String.init) ?? "" {
+        case "once": return .once
+        case "always": return .always
+        case "until":
+            guard fields.count > 1, let epoch = Int(fields[1]) else { return .off }
+            return .until(epoch)
+        default: return .off
+        }
+    }
+
+    // The timer item's label has to name the real number of minutes, so read
+    // it from `lich config` ("key=value" lines, defaults included) rather than
+    // hardcoding one that quietly disagrees with the CLI. The 30 here is only
+    // the last resort for a CLI that cannot answer at all.
+    var roamMins: Int {
+        let result = lich(["config"])
+        guard result.status == 0 else { return 30 }
+        for line in result.output.split(separator: "\n") {
+            let pair = line.split(separator: "=", maxSplits: 1)
+            guard pair.count == 2,
+                  pair[0].trimmingCharacters(in: .whitespaces) == "roam_mins",
+                  let mins = Int(pair[1].trimmingCharacters(in: .whitespaces))
+            else { continue }
+            return mins
+        }
+        return 30
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -118,6 +168,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
 
+    // The three roam items are checkboxes, so each one is its own off switch:
+    // clicking an armed mode disarms it. Arming never has to clear the other
+    // two by hand — roam is a single value in the CLI, so writing one mode
+    // replaces whatever was there. Arming also raises the lich (the CLI does
+    // that too), hence the refresh for the icon.
+    @objc func roamOnce(_ sender: NSMenuItem) {
+        armRoam(sender.state == .on ? ["roam", "off"] : ["roam"])
+    }
+
+    @objc func roamAlways(_ sender: NSMenuItem) {
+        armRoam(sender.state == .on ? ["roam", "off"] : ["roam", "always"])
+    }
+
+    @objc func roamTimer(_ sender: NSMenuItem) {
+        armRoam(sender.state == .on ? ["roam", "off"] : ["roam", "timer"])
+    }
+
+    func armRoam(_ args: [String]) {
+        lich(args)
+        refresh()
+    }
+
     func showMenu() {
         let menu = NSMenu()
         // Rendered as disabled header lines: whatever `lich status` prints
@@ -132,6 +204,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             withTitle: risen ? "Lay to rest (off)" : "Raise the lich (on)",
             action: #selector(toggle), keyEquivalent: "")
         toggleItem.target = self
+
+        // Roaming, in plain English — no lore in the labels, because the thing
+        // a user is choosing here is "don't sleep when I unplug". One read of
+        // the CLI feeds all three checkmarks so they can't disagree with each
+        // other mid-menu. Durations are deliberately not editable here: the
+        // minutes live in `lich config`, and this menu just reflects them.
+        menu.addItem(.separator())
+        let mode = roamMode
+        var isTimed = false
+        if case .until = mode { isTimed = true }
+        let roamItems: [(String, Selector, Bool)] = [
+            ("Stay awake unplugged — once", #selector(roamOnce(_:)), mode == .once),
+            ("Stay awake unplugged — always", #selector(roamAlways(_:)), mode == .always),
+            ("Stay awake unplugged — for \(roamMins) min", #selector(roamTimer(_:)), isTimed),
+        ]
+        for (title, action, checked) in roamItems {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.state = checked ? .on : .off
+        }
+
+        menu.addItem(.separator())
         let loginItem = menu.addItem(
             withTitle: "Start at Login",
             action: #selector(toggleLoginItem), keyEquivalent: "")

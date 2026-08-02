@@ -11,12 +11,19 @@
 #   `lich install` loads a per-user LaunchAgent that runs `lich watch`.
 #   Every 5 seconds the watcher reads the risen/at-rest flag in
 #   ~/.lich/desired-state and the power source, and flips the hidden
-#   `pmset disablesleep` setting: 1 when risen AND on AC power
+#   `pmset disablesleep` setting: 1 when risen AND (on AC power OR roaming)
 #   (lid-close no longer sleeps), 0 otherwise. `lich on|off` just writes the
 #   flag — so anything that can write a file (the menu bar app, the Control
 #   Center toggle, an ssh session) can control it. Because the watcher is a
 #   per-user LaunchAgent it only exists while you're logged in — at logout
 #   launchd sends SIGTERM and the cleanup trap re-enables normal sleep.
+#
+#   Roaming (~/.lich/roam) is the deliberate exception to "no cord, no lich":
+#   staying risen on battery for one trip, for a timer, or always — always
+#   under a battery floor (~/.lich/config) that outranks every mode and every
+#   caller. The same tick that reconciles power expires timers, spends
+#   one-shots and enforces the floor, so a roam ends within ~5 seconds of the
+#   condition that ends it.
 #
 # Read this before you grant sudo (then read the rest — it's one short file):
 #   * The passwordless sudoers rule installed here permits exactly two command
@@ -44,12 +51,34 @@ SUDOERS="/etc/sudoers.d/lichbook"
 LOG_FILE="$HOME/Library/Logs/lich.log"
 STATE_DIR="$HOME/.lich"            # sandboxed Control Center widget writes here
 FLAG="$STATE_DIR/desired-state"    # contents: "on" (risen) or "off" (at rest)
+ROAM="$STATE_DIR/roam"             # "off" | "once" | "always" | "until <epoch>"
+CONFIG="$STATE_DIR/config"         # key=value lines: floor, roam_mins
 PMSET="/usr/bin/pmset"             # absolute: the sudoers rule matches this
                                    # exact string, so every caller must too
 POLL_INTERVAL=5   # seconds between checks; the worst-case delay for a flag
                   # flip or plug/unplug to take effect
 
+# Roaming defaults, used whenever ~/.lich/config is missing or says nothing
+# about a key. The floor is the one number that overrules the user: below it
+# roaming ends, always-mode included. A machine that runs itself flat in a bag
+# is a worse tool than one that sleeps, so there is no override flag.
+DEFAULT_FLOOR=20        # percent
+DEFAULT_ROAM_MINS=30    # minutes, for `lich roam timer`
+
+# Watcher memory — meaningful only inside the `watch` loop, where the process
+# lives for the whole session. Deliberately not persisted: a watcher restart
+# forgetting these is acceptable (worst case, an armed one-shot survives one
+# extra plug-in, and a suspension is logged twice).
+ROAM_GRANTED_ON_BATTERY=0   # a "once" roam actually held the Mac awake off AC
+FLOOR_SUSPEND_LOGGED=0      # always-mode floor suspension: log once, not 12/min
+BATTERY_UNREADABLE_LOGGED=0 # ditto for an unparsable battery reading
+BATTERY_PCT=100             # last reading; set by read_battery, never read raw
+
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+# Same log, on stderr. Under launchd both streams land in $LOG_FILE, so this
+# still gets written down — but it stays out of stdout, which `roam status`
+# and `config` promise to keep machine-readable.
+log_warn() { log "$*" >&2; }
 die() { echo "lich: $*" >&2; exit 1; }
 
 # ---------- state probes ----------------------------------------------------
@@ -63,6 +92,200 @@ power_source() { on_ac && echo "AC (phylactery intact)" || echo "battery"; }
 # What you asked for. A missing or unreadable flag reads as at rest, so the
 # safe answer is always the default one.
 risen() { [[ "$(cat "$FLAG" 2>/dev/null)" == "on" ]]; }
+
+# The first percentage `pmset -g batt` prints — the internal battery's charge —
+# left in $BATTERY_PCT. Anything we can't parse (a desktop Mac, an unexpected
+# format) reads as 100: fail toward staying awake, exactly like every other
+# probe here, and say so in the log the first time.
+#
+# It sets a variable instead of printing one because a `$(...)` caller runs it
+# in a subshell, where the "log this once" latch would be thrown away with the
+# subshell and the watcher would repeat the warning twelve times a minute.
+read_battery() {
+  local p
+  p="$("$PMSET" -g batt 2>/dev/null | grep -o '[0-9][0-9]*%' | head -1 | tr -d '%' || true)"
+  if [[ "$p" =~ ^[0-9]+$ ]]; then
+    BATTERY_PCT="$p"
+  else
+    BATTERY_PCT=100
+    if [[ "$BATTERY_UNREADABLE_LOGGED" == 0 ]]; then
+      log_warn "WARNING: cannot read battery percentage from 'pmset -g batt' — assuming 100%"
+      BATTERY_UNREADABLE_LOGGED=1
+    fi
+  fi
+}
+
+# ~/.lich/config, one key=value per line. Deliberately dumb: no arrays (bash
+# 3.2 has none), last assignment wins, surrounding whitespace trimmed, and
+# anything that isn't a plain integer — junk value, unknown key, missing file —
+# falls back to the default rather than failing.
+config_get() {
+  local key="$1" def="$2" v=""
+  if [[ -f "$CONFIG" ]]; then
+    v="$(awk -F= -v k="$key" '
+          NF < 2 { next }
+          { name = $1; val = $2
+            gsub(/^[ \t]+|[ \t]+$/, "", name)
+            gsub(/^[ \t]+|[ \t]+$/, "", val)
+            if (name == k) out = val }
+          END { print out }' "$CONFIG" 2>/dev/null || true)"
+  fi
+  [[ "$v" =~ ^[0-9]+$ ]] || v="$def"
+  echo "$v"
+}
+
+# Rewrite one key, leaving every other line (including keys we don't know)
+# alone. Temp file in the same directory so the replace is an atomic rename —
+# the watcher reads this file every tick and must never see half of it.
+config_set() {
+  local key="$1" val="$2" tmp
+  mkdir -p "$STATE_DIR"
+  tmp="$STATE_DIR/.config.$$"
+  : > "$tmp"
+  if [[ -f "$CONFIG" ]]; then
+    grep -v "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG" >> "$tmp" || true
+  fi
+  printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  mv "$tmp" "$CONFIG"
+}
+
+# ---------- roaming --------------------------------------------------------
+# Roaming is staying risen without the phylactery: awake on battery, because
+# you said so, until the trip ends or the floor calls the loan. One file, one
+# value — arming a mode replaces whatever was there, so the three modes are
+# mutually exclusive for free.
+
+# Raw contents, first line only. Missing file = off, which is the state a Mac
+# that has never heard of roaming should be in.
+roam_mode() {
+  local m
+  m="$(head -1 "$ROAM" 2>/dev/null || true)"
+  m="${m#"${m%%[![:space:]]*}"}"   # trim leading whitespace
+  m="${m%"${m##*[![:space:]]}"}"   # trim trailing whitespace
+  [[ -n "$m" ]] || m="off"
+  echo "$m"
+}
+
+# Write-then-rename, so a tick that reads this file in the same instant sees
+# the old value or the new one and never an empty file — an empty read means
+# "off", which on battery with the lid shut would sleep the Mac mid-roam.
+roam_set() {
+  local tmp
+  mkdir -p "$STATE_DIR"
+  tmp="$STATE_DIR/.roam.$$"
+  printf '%s\n' "$1" > "$tmp"
+  mv "$tmp" "$ROAM"
+}
+
+# The mode as a reader should see it: same four values as the file, except an
+# elapsed timer and anything unrecognized report "off". Pure — no writes, no
+# log lines — because `lich roam status` is parsed by the menu bar app and
+# `lich status` must stay read-only. Clearing an expired timer is the
+# watcher's job, and only the watcher's, so the log gets exactly one line
+# about it.
+roam_state() {
+  local mode epoch
+  mode="$(roam_mode)"
+  case "$mode" in
+    once|always) echo "$mode" ;;
+    'until '*)
+      epoch="${mode#until }"
+      if [[ "$epoch" =~ ^[0-9]+$ ]] && [[ "$(date +%s)" -lt "$epoch" ]]; then
+        echo "until $epoch"
+      else
+        echo off
+      fi
+      ;;
+    *) echo off ;;
+  esac
+}
+
+# Roaming in English, for `lich status`. Same pure read as roam_state.
+roam_human() {
+  local state epoch left
+  state="$(roam_state)"
+  case "$state" in
+    once)   echo "once — stays risen unplugged, until you plug back in" ;;
+    always) echo "always — stays risen unplugged" ;;
+    'until '*)
+      epoch="${state#until }"
+      left=$(( ( epoch - $(date +%s) + 59 ) / 60 ))   # round up: 0 min left
+      [[ "$left" -lt 1 ]] && left=1                   # reads as expired
+      echo "$left min left — stays risen unplugged"
+      ;;
+    *) echo "off — unplugged means sleep" ;;
+  esac
+}
+
+# The watcher's question, asked only on battery (on AC the answer doesn't
+# matter — the phylactery already keeps the lich up). Unlike everything above
+# this one is allowed to write: expiry, floor breach and their log lines are
+# state changes the watcher owns.
+roam_active() {
+  local mode floor epoch
+  mode="$(roam_mode)"
+  [[ "$mode" == "off" ]] && return 1
+
+  # The floor outranks every mode, always-mode included. A once/timed roam
+  # that hits it is spent — cleared, so nothing silently resumes at 19%. An
+  # always-mode roam is only suspended: it is a standing preference, not a
+  # trip, and it must survive to the next charge.
+  floor="$(config_get floor "$DEFAULT_FLOOR")"
+  read_battery
+  if [[ "$BATTERY_PCT" -le "$floor" ]]; then
+    case "$mode" in
+      always)
+        if [[ "$FLOOR_SUSPEND_LOGGED" == 0 ]]; then
+          log "battery floor ${floor}% — roam suspended (always-mode kept)"
+          FLOOR_SUSPEND_LOGGED=1
+        fi
+        ;;
+      *)
+        roam_set off
+        log "battery floor ${floor}% — roam canceled"
+        ;;
+    esac
+    return 1
+  fi
+
+  case "$mode" in
+    once)
+      # Remember that the grant did real work, so the return of the
+      # phylactery can spend it. In-memory on purpose (see the top of file).
+      ROAM_GRANTED_ON_BATTERY=1
+      return 0
+      ;;
+    always) return 0 ;;
+    'until '*)
+      epoch="${mode#until }"
+      if [[ "$epoch" =~ ^[0-9]+$ ]] && [[ "$(date +%s)" -lt "$epoch" ]]; then
+        return 0
+      fi
+      roam_set off
+      log "roam timer expired"
+      return 1
+      ;;
+    *)
+      # Unrecognized contents. Treat as off — same posture as the risen flag,
+      # where only the exact expected string counts.
+      return 1
+      ;;
+  esac
+}
+
+# What the tick has to do about roaming when the cord is back: spend a
+# one-shot that was actually used, and re-arm the once-per-session suspension
+# notice. Only ever called with AC present.
+roam_on_ac() {
+  if [[ "$ROAM_GRANTED_ON_BATTERY" == 1 && "$(roam_mode)" == "once" ]]; then
+    roam_set off
+    log "phylactery restored — one-shot roam spent"
+  fi
+  ROAM_GRANTED_ON_BATTERY=0
+  FLOOR_SUSPEND_LOGGED=0
+}
+
+# ---------- more state probes ----------------------------------------------
 
 # What the kernel actually has set — not necessarily what we last asked for
 # (a reboot, a crash, another tool). Ground truth for reconcile.
@@ -86,15 +309,27 @@ lock_console() { open -a ScreenSaverEngine 2>/dev/null || true; }
 # ---------- watcher (runs under launchd; not meant to be called by hand) ----
 
 # The entire policy: disablesleep is 1 only when you have raised the lich AND
-# the phylactery is intact. Idempotent — compares desired against live and
-# calls sudo only on a difference, so the 5-second loop stays silent until
-# something actually changes.
+# (the phylactery is intact OR you asked to roam without it). Idempotent —
+# compares desired against live and calls sudo only on a difference, so the
+# 5-second loop stays silent until something actually changes.
+#
+# Order matters. roam_active is asked only on battery, both because on AC the
+# answer is irrelevant and because asking it is what expires timers and
+# enforces the floor — work that belongs to a tick that is actually running on
+# battery. The AC branch does the mirror-image bookkeeping: spending a
+# one-shot the moment the cord comes back.
 reconcile() {
-  local want=0
-  risen && on_ac && want=1
+  local want=0 roam=off
+  if on_ac; then
+    roam_on_ac
+    if risen; then want=1; fi
+  elif risen && roam_active; then
+    want=1
+  fi
   [[ "$(sleep_disabled)" == "$want" ]] && return 0
+  roam="$(roam_state)"
   if sudo -n "$PMSET" -a disablesleep "$want" 2>/dev/null; then
-    log "risen=$(risen && echo yes || echo no) power=$(power_source) -> disablesleep=$want"
+    log "risen=$(risen && echo yes || echo no) power=$(power_source) roam=$roam -> disablesleep=$want"
   else
     # Refused, and -n means we never hung on a prompt to find out. Don't spin
     # silently: die and let the log say why.
@@ -127,16 +362,36 @@ cmd_watch() {
   # guarantee itself: on the tick where the lid goes shut while we hold the
   # machine awake, lock the console. Once per closure, not continuously — so
   # a deliberate unlock over Screen Sharing with the lid down isn't fought.
+  # The lock is *requested*, then *verified* on the following tick — because
+  # locking rides on the user's "require password after screen saver/display
+  # off" setting, which lich cannot see and Tahoe has known regressions in.
+  # One verdict per closure, logged honestly; no retry loop, so a deliberate
+  # unlock over Screen Sharing with the lid down is never fought.
   LID_WAS_CLOSED=0
+  LOCK_PENDING=0
   while :; do
     reconcile || exit $?   # broken sudoers = die loudly; launchd retries
     if [[ "$(sleep_disabled)" == "1" ]] && lid_closed; then
       if [[ "$LID_WAS_CLOSED" == 0 ]]; then
-        console_locked || { lock_console; log "lid closed while risen — screen locked"; }
+        if console_locked; then
+          LOCK_PENDING=0
+        else
+          lock_console
+          log "lid closed while risen — lock requested"
+          LOCK_PENDING=1
+        fi
         LID_WAS_CLOSED=1
+      elif [[ "$LOCK_PENDING" == 1 ]]; then
+        if console_locked; then
+          log "lock confirmed"
+        else
+          log_warn "WARNING: lock did NOT take — an opened lid lands on your desktop. Check System Settings > Lock Screen: 'Require password after screen saver begins or display is turned off' (set it to 'Immediately')."
+        fi
+        LOCK_PENDING=0
       fi
     else
       LID_WAS_CLOSED=0
+      LOCK_PENDING=0
     fi
     sleep "$POLL_INTERVAL"
   done
@@ -147,16 +402,28 @@ cmd_watch() {
 # bar app, the Control Center toggle and an ssh one-liner are all equally valid
 # front ends — they write the same file.
 
-cmd_on() {
+# Writing the flag and applying it now, without the announcement — `lich on`
+# and every `lich roam` form need exactly this, and they say different things
+# about it afterwards.
+raise() {
   mkdir -p "$STATE_DIR"
   echo on > "$FLAG"
   # Apply now instead of waiting up to POLL_INTERVAL for the tick. Tolerate
-  # failure (not installed yet): the flag is set, and the warning below says
-  # what to do about it.
+  # failure (not installed yet): the flag is set, and the callers' warning
+  # says what to do about it.
   reconcile || true
-  echo "💀 lich risen — lid-close keeps this Mac awake while on AC power"
-  # Worth saying loudly: with no watcher, nothing will undo this on unplug.
+}
+
+# Worth saying loudly: with no watcher, nothing will undo any of this on
+# unplug, on a timer, or at the battery floor.
+warn_no_watcher() {
   watcher_running || echo "warning: watcher not running — run: lich install" >&2
+}
+
+cmd_on() {
+  raise
+  echo "💀 lich risen — lid-close keeps this Mac awake while on AC power"
+  warn_no_watcher
 }
 
 cmd_off() {
@@ -166,6 +433,113 @@ cmd_off() {
   # no watcher. Best-effort: the flag is what matters.
   sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
   echo "⚰️  lich at rest — normal sleep behavior restored"
+}
+
+# ---------- roaming commands ------------------------------------------------
+# Every arming form also raises the lich: "keep me awake off the cord" is one
+# intention, and making it two commands only invites the half-armed state
+# where roam is set and the flag isn't. `off` and `status` never touch the
+# risen flag — laying the lich to rest stays a separate, deliberate decision.
+
+cmd_roam() {
+  local arg="${1:-once}" mins floor epoch
+
+  case "$arg" in
+    # Read-only forms first, so nothing below can be reached by accident.
+    status)
+      # EXACTLY one bare line: the menu bar app parses this. No decoration,
+      # no second line, no emoji — and no writes (see roam_state).
+      roam_state
+      return 0
+      ;;
+    off)
+      roam_set off
+      echo "roam off — unplugging lays the lich to rest again"
+      return 0
+      ;;
+  esac
+
+  floor="$(config_get floor "$DEFAULT_FLOOR")"
+  case "$arg" in
+    ""|once)
+      roam_set once
+      raise
+      echo "💀 roaming once — risen without the phylactery until you plug back in (floor ${floor}%)"
+      ;;
+    always)
+      roam_set always
+      raise
+      echo "💀 roaming always — unplugging no longer rests the lich (floor ${floor}% still does)"
+      ;;
+    timer)
+      mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
+      cmd_roam "$mins"
+      return 0
+      ;;
+    *)
+      # `lich roam 45` and `lich roam 45m` are the same request.
+      if [[ "$arg" =~ ^([0-9]+)m?$ ]]; then
+        mins="${BASH_REMATCH[1]}"
+        [[ "$mins" -ge 1 ]] || die "roam: minutes must be 1 or more"
+        epoch=$(( $(date +%s) + mins * 60 ))
+        roam_set "until $epoch"
+        raise
+        echo "💀 roaming for ${mins} min — risen without the phylactery until $(date -r "$epoch" '+%H:%M') (floor ${floor}%)"
+      else
+        die "unknown roam mode: $arg (try: lich roam, roam always, roam <minutes>, roam timer, roam off, roam status)"
+      fi
+      ;;
+  esac
+  warn_no_watcher
+}
+
+# For an agent handing the machine back. It spends a trip it may have been
+# given; it does not spend the owner's standing preference, and it never lays
+# the lich to rest — `lich off` is a human decision about a human's Mac.
+cmd_done() {
+  case "$(roam_mode)" in
+    once|'until '*)
+      roam_set off
+      echo "roam cleared — this Mac may sleep again once unplugged (still risen; 'lich off' to rest)"
+      ;;
+    always)
+      echo "roam is 'always' — left as is; clear it yourself with: lich roam off"
+      ;;
+    *)
+      echo "roam already off — nothing to clear"
+      ;;
+  esac
+}
+
+# ---------- config ----------------------------------------------------------
+
+cmd_config() {
+  local key="${1:-}" val="${2:-}"
+  case "$key" in
+    "")
+      # The *effective* config, defaults included — the menu bar app reads
+      # roam_mins from here to label its timer item, so it must always answer.
+      echo "floor=$(config_get floor "$DEFAULT_FLOOR")"
+      echo "roam_mins=$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
+      ;;
+    floor)
+      [[ "$val" =~ ^[0-9]+$ ]] || die "config floor: need a whole number of percent (5-95)"
+      # 5 is low enough to be reckless but not bricking; 95 keeps the setting
+      # from being a way to disable roaming by accident.
+      [[ "$val" -ge 5 && "$val" -le 95 ]] || die "config floor: must be between 5 and 95"
+      config_set floor "$val"
+      echo "floor=$val"
+      ;;
+    roam_mins)
+      [[ "$val" =~ ^[0-9]+$ ]] || die "config roam_mins: need a whole number of minutes (1-1440)"
+      [[ "$val" -ge 1 && "$val" -le 1440 ]] || die "config roam_mins: must be between 1 and 1440"
+      config_set roam_mins "$val"
+      echo "roam_mins=$val"
+      ;;
+    *)
+      die "unknown config key: $key (known: floor, roam_mins)"
+      ;;
+  esac
 }
 
 cmd_status() {
@@ -188,13 +562,27 @@ cmd_status() {
   else
     echo "sleep:   normal — lid-close sleeps"
   fi
+  # Roaming and the battery are two lines, not one, for the same reason as
+  # above: they legitimately disagree. "roam: always" with the battery under
+  # the floor is a suspended preference, not a contradiction.
+  local floor; floor="$(config_get floor "$DEFAULT_FLOOR")"
+  read_battery
+  echo "roam:    $(roam_human)"
+  echo "battery: ${BATTERY_PCT}% (floor ${floor}%)"
   watcher_running && echo "watcher: running" || echo "watcher: NOT running (run: lich install)"
   if ! risen; then
     echo
     echo "raise it: lich on    (stays awake with the lid closed while plugged in)"
   elif ! on_ac; then
     echo
-    echo "note: on battery — the lich rests until the phylactery (AC power) returns"
+    if [[ "$(roam_state)" == "off" ]]; then
+      echo "note: on battery — the lich rests until the phylactery (AC power) returns"
+      echo "      (or roam: lich roam — stay risen unplugged, down to the floor)"
+    elif [[ "$BATTERY_PCT" -le "$floor" ]]; then
+      echo "note: below the battery floor — roaming is off until you charge past it"
+    else
+      echo "note: roaming — risen without the phylactery; 'lich done' when the work is finished"
+    fi
   fi
 }
 
@@ -213,9 +601,20 @@ cmd_install() {
     self="${self%%/Cellar/*}/opt/lichbook/bin/lich"
   fi
 
+  # ---- fail-open zone -------------------------------------------------------
+  # Policy: only the current latest macOS is tested. Anywhere else, a partial
+  # install is an EXPECTED outcome, not an error to abort on — so from here to
+  # the summary, no step may end the run. Each step is attempted on its own,
+  # failures warn and continue, and the summary tells the truth about what
+  # works. Exit status: 0 unless the load-bearing sudoers step failed.
+  set +e
+
+  local st_sudoers=failed st_link=failed st_flag=failed st_plist=failed st_agent=failed
+  local note_sudoers="" note_link="" note_flag="" note_plist="" note_agent="" have_sudo=0 i=0
+
   # Say it out loud first, in the order it happens. Anyone about to type their
   # password deserves the list.
-  echo "This sets up (sudo will prompt once):"
+  echo "This sets up (one sudo prompt):"
   echo "  1. $SUDOERS — passwordless sudo for EXACTLY two commands:"
   echo "       pmset -a disablesleep 0   and   pmset -a disablesleep 1"
   echo "  2. lich on your PATH (skipped if it already is, e.g. via Homebrew)"
@@ -223,40 +622,71 @@ cmd_install() {
   echo "  4. $PLIST (per-user LaunchAgent, runs as you, loaded now)"
   echo
 
-  # 1. The scoped sudoers rule. Written to a temp file and checked with
-  #    `visudo -cf` FIRST: a syntax error in a live sudoers file can break
-  #    sudo for the whole machine, and you'd find out at the worst moment.
-  #    Failed validation aborts with nothing installed. Installed root:wheel
-  #    0440 because sudo refuses to read it otherwise.
-  tmp="$(mktemp)"
-  cat > "$tmp" <<EOF
+  # One credential prompt, up front. Declined or unavailable = the privileged
+  # steps below are skipped in one go instead of re-prompting at each.
+  sudo -v && have_sudo=1
+
+  # 1. The scoped sudoers rule (the load-bearing step). Validated with
+  #    `visudo -cf` BEFORE it goes live — a syntax error in a live sudoers
+  #    file can break sudo machine-wide. Then PROVED, not assumed: the probe
+  #    runs the exact call the watcher will make every 5s forever. `-k` first
+  #    drops the credential `sudo -v` just cached (without it the probe passes
+  #    on a machine with no rule at all); re-applying the current live value
+  #    makes the probe a visible no-op.
+  if [[ "$have_sudo" == 1 ]]; then
+    tmp="$(mktemp)"
+    cat > "$tmp" <<EOF
 # lichbook: allow toggling lid-close sleep without a password.
 # Scoped to exactly these two commands — nothing else.
 $USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1
 EOF
-  sudo /usr/sbin/visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "generated sudoers failed validation — aborting, nothing installed"; }
-  sudo install -o root -g wheel -m 0440 "$tmp" "$SUDOERS"
-  rm -f "$tmp"
+    if ! sudo /usr/sbin/visudo -cf "$tmp" >/dev/null 2>&1; then
+      note_sudoers="generated rule failed visudo validation — nothing was written"
+    elif ! sudo install -o root -g wheel -m 0440 "$tmp" "$SUDOERS" 2>/dev/null; then
+      note_sudoers="could not write $SUDOERS"
+    else
+      sudo -k
+      if sudo -n "$PMSET" -a disablesleep "$(sleep_disabled)" 2>/dev/null; then
+        st_sudoers=ok
+      else
+        note_sudoers="rule written but the passwordless probe failed"
+      fi
+    fi
+    rm -f "$tmp"
+  else
+    st_sudoers=skipped note_sudoers="no sudo credential"
+  fi
+  [[ "$st_sudoers" == ok ]] || echo "lich: warning: sudoers: $note_sudoers" >&2
 
   # 2. Put `lich` on PATH — only if it isn't already. Homebrew owns its own
   #    symlink and clobbering it would leave brew managing a file it no longer
   #    controls; this branch really means "running from a clone".
-  if ! command -v lich >/dev/null 2>&1; then
-    sudo mkdir -p "$(dirname "$CLI_LINK")"
-    sudo ln -sf "$self" "$CLI_LINK"
+  if command -v lich >/dev/null 2>&1; then
+    st_link=skipped note_link="already on PATH"
+  elif [[ "$have_sudo" == 1 ]] && sudo mkdir -p "$(dirname "$CLI_LINK")" 2>/dev/null \
+       && sudo ln -sf "$self" "$CLI_LINK" 2>/dev/null; then
+    st_link=ok
+  else
+    note_link="could not create $CLI_LINK — run it as: $self"
+    echo "lich: warning: PATH: $note_link" >&2
   fi
 
   # 3. State flag, at rest. An existing choice is left alone, so reinstalling
   #    or upgrading never changes what your Mac is doing.
-  mkdir -p "$STATE_DIR"
-  [[ -f "$FLAG" ]] || echo off > "$FLAG"
+  if mkdir -p "$STATE_DIR" 2>/dev/null && { [[ -f "$FLAG" ]] || echo off > "$FLAG"; } 2>/dev/null; then
+    st_flag=ok
+  else
+    note_flag="could not create $FLAG — on/off (and the toggles) cannot record state"
+    echo "lich: warning: state: $note_flag" >&2
+  fi
 
-  # 4. The LaunchAgent, aimed at the $self resolved above. Per-user (gui/$UID)
-  #    rather than a root LaunchDaemon — that choice is what ties its lifetime
-  #    to your login session. RunAtLoad starts it now and at every login;
-  #    KeepAlive restarts it if it dies. Both streams go to one log.
-  mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG_FILE")"
-  cat > "$PLIST" <<EOF
+  # 4a. The LaunchAgent plist, aimed at the $self resolved above. Per-user
+  #     (gui/$UID) rather than a root LaunchDaemon — that choice is what ties
+  #     its lifetime to your login session. Written even when earlier steps
+  #     failed: it is a plain file in your own home, and having it on disk is
+  #     what makes a re-run or a manual bootstrap recoverable.
+  if mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG_FILE")" 2>/dev/null; then
+    cat > "$PLIST" 2>/dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -274,13 +704,66 @@ EOF
 </dict>
 </plist>
 EOF
-  # Load it: bootstrap on first install, kickstart -k when the label is already
-  # loaded (bootstrap fails then — a reinstall, not an error). `enable` clears
-  # any disabled flag left behind by a previous uninstall.
-  launchctl enable "gui/$UID/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null || launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null || true
+    [[ -s "$PLIST" ]] && st_plist=ok || note_plist="could not write $PLIST"
+  else
+    note_plist="could not create $(dirname "$PLIST")"
+  fi
+  [[ "$st_plist" == ok ]] || echo "lich: warning: plist: $note_plist" >&2
 
-  echo "Installed. Raise it with: lich on"
+  # 4b. Load it — but ONLY with a proven sudoers rule. Without one the watcher
+  #     exits EX_CONFIG on its first tick and KeepAlive respawns it forever:
+  #     an ERROR line in the log every ~10s until someone notices. Skipping is
+  #     kinder than that loop. Liveness is measured by polling the agent, not
+  #     by trusting launchctl's exit status, which lies here.
+  if [[ "$st_sudoers" != ok ]]; then
+    st_agent=skipped note_agent="not loaded — sudoers rule not working"
+  elif [[ "$st_plist" != ok ]]; then
+    st_agent=skipped note_agent="not loaded — no plist"
+  else
+    launchctl enable "gui/$UID/$LABEL" 2>/dev/null
+    launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null || launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null
+    i=0
+    while [[ "$i" -lt 10 ]]; do
+      watcher_running && break
+      sleep 0.2; i=$((i + 1))
+    done
+    if watcher_running; then
+      st_agent=ok
+    else
+      note_agent="agent did not come up — see $LOG_FILE"
+      echo "lich: warning: agent: $note_agent" >&2
+    fi
+  fi
+
+  # ---- summary (the only way install ends) ----------------------------------
+  echo
+  echo "install summary:"
+  printf '  %-8s sudoers rule%s\n'  "$st_sudoers" "${note_sudoers:+ — $note_sudoers}"
+  printf '  %-8s PATH link%s\n'     "$st_link"    "${note_link:+ — $note_link}"
+  printf '  %-8s state flag%s\n'    "$st_flag"    "${note_flag:+ — $note_flag}"
+  printf '  %-8s watcher plist%s\n' "$st_plist"   "${note_plist:+ — $note_plist}"
+  printf '  %-8s watcher agent%s\n' "$st_agent"   "${note_agent:+ — $note_agent}"
+  echo
+  if [[ "$st_sudoers" == ok && "$st_agent" == ok ]]; then
+    echo "All set. Raise it with: lich on"
+  elif [[ "$st_sudoers" == ok ]]; then
+    echo "The CLI works right now — lich on/off apply the setting directly."
+    echo "But with NO watcher, nothing reverts it for you: unplugging will NOT"
+    echo "restore sleep, logout will NOT restore sleep, roam timers and the"
+    echo "battery floor do NOT run. For real protection keep 'lich watch'"
+    echo "running in a terminal or tmux, and re-run 'lich install' after"
+    echo "fixing the agent (start with $LOG_FILE)."
+  else
+    echo "Not functional yet: nothing can change the sleep setting, so"
+    echo "lid-close still sleeps normally. 'lich status' and the flag files"
+    echo "work; fix the rule and re-run 'lich install', or add it by hand"
+    echo "with 'sudo visudo -f $SUDOERS':"
+    echo "  $USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1"
+  fi
+  echo "(The menu bar app and Control Center toggle are separate source builds — see README.)"
+
+  set -e
+  [[ "$st_sudoers" == ok ]]
 }
 
 cmd_reload() {
@@ -321,8 +804,21 @@ usage: lich [command]     (bare `lich` = status)
 
   on         raise: stay awake with lid closed while on AC power
   off        rest: normal sleep behavior
-  status     show risen state, power source, sleep setting, watcher health
+  status     show risen state, power source, sleep setting, roam mode,
+             battery vs. floor, watcher health
              -q, --quiet  print nothing; exit 0 if risen, non-zero if at rest
+  roam       stay risen unplugged for one trip, and raise if at rest
+             roam always   every unplug, until you turn it off
+             roam <N>      for N minutes (45 or 45m); also: roam timer,
+                           which uses the configured roam_mins
+             roam off      stop roaming (leaves the risen flag alone)
+             roam status   one bare line: off | once | always | until <epoch>
+  done       for agents: clear a once/timed roam now the work is finished.
+             Never touches 'always' (the owner's preference, not yours) and
+             never lays the lich to rest
+  config     print effective settings as key=value (floor, roam_mins)
+             config floor <5-95>        battery % where roaming ends
+             config roam_mins <1-1440>  what 'roam timer' means
   install    one-time setup, prompts for sudo once: sudoers rule scoped to
              two pmset commands, ~/.lich state flag, LaunchAgent watcher, and
              /usr/local/bin/lich unless lich is already on PATH
@@ -333,11 +829,17 @@ usage: lich [command]     (bare `lich` = status)
 
 While risen: plugged in + logged in = never sleeps, lid open or closed.
 On battery, or logged out, or at rest: sleeps like a normal Mac.
-The power cord is the phylactery — sever it and the lich rests.
+The power cord is the phylactery — sever it and the lich rests, unless you
+asked to roam.
+
+Roaming is the one exception, and it has a hard floor: at or below the
+battery floor (20% by default) roaming ends — a once/timed roam is canceled,
+an 'always' roam is suspended until you charge past it. There is no override.
 
 The flag lives in ~/.lich/desired-state ("on"/"off") — the menu bar app and
 Control Center toggle flip the same flag, and the watcher acts on it within
-about 5 seconds. Log: ~/Library/Logs/lich.log
+about 5 seconds. Roaming lives beside it in ~/.lich/roam and ~/.lich/config.
+Log: ~/Library/Logs/lich.log
 EOF
 }
 
@@ -346,6 +848,9 @@ case "${1:-status}" in
   on)        cmd_on ;;
   off)       cmd_off ;;
   status)    cmd_status "${2:-}" ;;
+  roam)      cmd_roam "${2:-}" ;;
+  done)      cmd_done ;;
+  config)    cmd_config "${2:-}" "${3:-}" ;;
   watch)     cmd_watch ;;
   install)   cmd_install ;;
   reload)    cmd_reload ;;

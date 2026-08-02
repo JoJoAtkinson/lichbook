@@ -2,7 +2,9 @@
 
 **Close your lid. Your prompts, agents, and remote sessions keep running.**
 Only while it's plugged in and you're logged in — unplug it, log out, or lay
-it to rest, and it sleeps like any mortal machine.
+it to rest, and it sleeps like any mortal machine. (Need it awake off the
+cord for a while? That's [roaming](#roaming-staying-awake-on-battery), and
+it has a battery floor.)
 
 ## Install
 
@@ -19,7 +21,8 @@ remote-control`, ssh sessions, and long jobs keep going.
 ## Use
 
 ```sh
-lich          # status: risen or at rest, power source, sleep setting, watcher health
+lich          # status: risen or at rest, power source, sleep setting,
+              #         watcher health, roam mode, battery vs. floor
 lich on       # 💀 risen — lid-close keeps the Mac awake while on AC
 lich off      # ⚰️ at rest — normal sleep
 ```
@@ -30,6 +33,78 @@ Both states persist across logins. Upgrade with:
 brew upgrade lichbook && lich reload
 ```
 
+## Roaming: staying awake on battery
+
+Sometimes the work has to leave the desk — an agent mid-run you carry to the
+couch, a build you'd rather not babysit next to an outlet. **Roaming is the
+lich risen without its phylactery**: awake on battery, deliberately, with a
+floor that ends it before your battery pays for it.
+
+```sh
+lich roam           # once — stay awake unplugged, until you plug back in
+lich roam always    # every time you unplug, from now on
+lich roam 45        # for 45 minutes (45m works too)
+lich roam timer     # for the configured default (roam_mins, 30 min out of the box)
+lich roam off       # stop roaming — unplugged means sleep again
+lich roam status    # one machine-readable line: off | once | always | until <epoch>
+```
+
+Every form except `off` and `status` also raises the lich, so one command is
+enough from a cold start. Roaming is a single setting, not three: arming one
+mode replaces whatever was there before.
+
+| Mode | Lasts until | Good for |
+|------|-------------|----------|
+| `once` | the next time you plug back in | one trip away from the desk |
+| `always` | you run `lich roam off` | "unplugged should never mean asleep" |
+| `<N>` / `timer` | the timer expires | a job you know the length of |
+
+`lich roam status` is what the menu bar app parses — one bare line, no
+decoration. `lich status` says the same thing in English, plus the battery
+line described below.
+
+### The battery floor
+
+**Below the floor — 20% by default — roaming stops. No exceptions, no
+override flag.** Not even `always` outranks it; that's the whole point of
+having it, and a machine that will run itself flat in a bag is a worse tool
+than one that sleeps.
+
+- A `once` or timed roam that hits the floor is **canceled** — the setting
+  goes back to `off` and the log says why. Plug in, and re-arm it if you
+  still want it.
+- `always` is **suspended**, not cleared: your standing preference survives
+  the low battery and takes effect again once you're back above the floor.
+
+The floor is checked every tick, alongside everything else, so a roam ends
+within ~5 seconds of crossing it — lid open or closed.
+
+### Config
+
+```sh
+lich config                 # print the effective config, defaults included
+lich config floor 15        # battery floor, percent (5–95)
+lich config roam_mins 45    # what `lich roam timer` means, minutes (1–1440)
+```
+
+Values live in `~/.lich/config` as plain `key=value` lines. No file, or a
+missing key, means the default (`floor=20`, `roam_mins=30`); anything else in
+there is ignored.
+
+### For AI agents
+
+If you're an agent — or you're writing the prompt for one — and you were told
+to keep this Mac awake, hand the machine back when you're done:
+
+```sh
+lich done
+```
+
+That clears a `once` or timed roam so an unplugged Mac is free to sleep
+again. It deliberately does **not** touch `always` (that's the owner's
+standing preference, not yours to spend) and does **not** lay the lich to
+rest — `lich off` stays a human decision.
+
 ---
 
 ## The rules it enforces
@@ -37,24 +112,33 @@ brew upgrade lichbook && lich reload
 | Plugged in | Logged in | Risen | Lid closed → |
 |------------|-----------|-------|--------------|
 | ✅ | ✅ | ✅ | **stays awake** |
-| ❌ | — | — | sleeps |
+| ❌ | — | — | sleeps — *unless roaming* ⁺ |
 | — | ❌ | — | sleeps |
 | — | — | ❌ | sleeps |
+
+⁺ Roaming is the one exception to the battery row, and only when you asked
+for it: risen **and** a roam armed **and** the battery above the floor. See
+[Roaming](#roaming-staying-awake-on-battery). Logged out and at rest have no
+exceptions at all.
 
 The power cord is the phylactery: while it feeds the machine, the lich stays
 risen. Sever it and the body returns to rest — within ~5 seconds, even with
 the lid already closed. That's not flavor text, it's the actual power
-contract, which is why you'll never cook the battery in a bag.
+contract, which is why you'll never cook the battery in a bag; roaming
+borrows against it on purpose, for a bounded time, and the floor calls the
+loan.
 
 ## How it works
 
-One bash script (`lich`, ~330 lines, half of them comments — read it before
-you grant it sudo) plus one per-user LaunchAgent,
+One bash script (`lich`, a few hundred lines, half of them comments — read it
+before you grant it sudo) plus one per-user LaunchAgent,
 `com.lichbook.watcher`:
 
 - The agent runs `lich watch`, which every 5 seconds reads the risen flag and
   the power source and flips the hidden `pmset disablesleep` setting: `1` when
-  risen **and** on AC power, `0` otherwise. `disablesleep` is the only
+  risen **and** (on AC power **or** roaming), `0` otherwise. The same tick
+  reads the battery percentage, so an expired timer, a spent one-shot, or a
+  floor breach ends a roam within ~5 seconds. `disablesleep` is the only
   mechanism that blocks clamshell (lid-close) sleep — `caffeinate` cannot.
   Plain polling is deliberate: `pmset -g pslog` doesn't stream reliably under
   launchd (it exits after its header), and an event stream that can die takes
@@ -66,14 +150,20 @@ you grant it sudo) plus one per-user LaunchAgent,
   restores normal sleep on any exit.
 - **Lid close locks the screen.** Normally the lock rides along with sleep;
   since lich prevents the sleep, macOS never locks. The watcher detects the
-  lid closing while risen and locks the console itself (verified via
-  `IOConsoleLocked`), so an opened lid always lands on the password screen
-  while your session keeps running behind it.
+  lid closing while risen, locks the console itself, and then **verifies** the
+  lock took (`IOConsoleLocked`), warning in the log if it didn't. The lock
+  rides on your Lock Screen setting — keep "Require password after screen
+  saver begins or display is turned off" at **Immediately** (System Settings →
+  Lock Screen) or an opened lid can land on your desktop.
 
 The risen state is just a flag file, `~/.lich/desired-state`, containing `on`
 or `off`. The CLI, the menu bar app, and the Control Center toggle all flip
 the same flag; the watcher applies it within ~5 seconds. Anything else that
-can write a file — Shortcuts, ssh, cron — controls it the same way.
+can write a file — Shortcuts, ssh, cron — controls it the same way. Roaming
+is the same idea: `~/.lich/roam` holds `off`, `once`, `always`, or
+`until <epoch>`, and `~/.lich/config` holds the `floor` and `roam_mins`
+settings. The watcher owns those files too — it's what clears a spent
+one-shot, an expired timer, or a roam that hit the floor.
 
 ### What install does
 
@@ -95,8 +185,20 @@ Running from a clone works the same: `./lich install`, then `lich on`.
 ## Optional: menu bar app
 
 Left-click toggles 💀 risen / ⚰️ at rest; right-click gives status lines, a
-toggle, a "Start at Login" checkbox, and Quit. It shells out to the `lich`
-CLI, so the CLI stays the single source of truth.
+toggle, three roaming checkboxes, a "Start at Login" checkbox, and Quit. It
+shells out to the `lich` CLI, so the CLI stays the single source of truth.
+
+The roaming checkboxes are the three modes, in plain English:
+
+- **Stay awake unplugged — once**
+- **Stay awake unplugged — always**
+- **Stay awake unplugged — for N min** — N is your configured `roam_mins`,
+  read live, so the label shows the real number
+
+Ticking one arms that mode and clears the other two; ticking the checked one
+turns roaming off. Durations are set with `lich config roam_mins` and nowhere
+else — the menu stays a switch, not a settings panel. The battery floor
+applies here exactly as it does from the CLI.
 
 ```sh
 cd menubar && make install
@@ -121,20 +223,41 @@ Control Center → customize → add "Lich". Optionally drag the control onto th
 menu bar.
 
 The widget is sandboxed and can do exactly one thing: read and write
-`~/.lich/desired-state`.
+`~/.lich/desired-state`. Roaming is not in the widget — use the CLI or the
+menu bar app for that.
 
 ## Caveats
 
 - While awake with the lid closed, the machine vents less well. Fine on a
-  desk; don't leave it running in a bag or on a couch cushion.
-- While `disablesleep` is `1` (risen **and** on AC), manual sleep
+  desk; don't leave it running in a bag or on a couch cushion. Roaming makes
+  that easier to do by accident — the battery floor is a floor, not a
+  thermostat.
+- While `disablesleep` is `1` (risen **and** on AC or roaming), manual sleep
   (Apple menu → Sleep) is also blocked. `lich off` first if you want that.
-- A hard kill (SIGKILL, kernel panic) skips the cleanup trap. The watcher
-  re-reconciles at next login; worst case is one session of "won't sleep"
-  after a crash, visible in `lich status`.
+- **`disablesleep` survives reboots** — it lives in
+  `/Library/Preferences/com.apple.PowerManagement.plist` and powerd re-applies
+  it at boot (measured, not assumed). So a crash, kernel panic, or hard reboot
+  while risen leaves the Mac sleep-proof **at the login window**, where no
+  watcher runs to fix it — during that window it won't sleep even on battery,
+  lid open or closed. The first login repairs it within ~5 seconds. If a
+  crashed machine has to sit unattended, log in once (or run
+  `sudo pmset -a disablesleep 0`) before walking away.
 - Control Center shows power glyphs, not a skull — it only renders SF Symbols
   and Apple ships no skull or coffin. The 💀/⚰️ live in the CLI and menu bar.
 - Log: `~/Library/Logs/lich.log`.
+
+## Support policy
+
+Tested and supported on the **latest macOS only** (currently macOS 26,
+"Tahoe" — the version this was built and verified on). Earlier versions:
+you're welcome to install it — `lich install` fails open, meaning every piece
+tries, warns if it can't, and the CLI keeps working with whatever succeeded —
+but it's untested there, only loosely supported, and gets no version checks,
+no gates, and no promises.
+
+The formal behavior reference — every configuration worth naming, what the
+code verifiably does about it, and what is merely promised — lives in
+[docs/STATE-TABLE.md](docs/STATE-TABLE.md).
 
 ## Credits
 
