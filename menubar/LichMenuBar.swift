@@ -7,6 +7,7 @@
 // /usr/local/bin/lich, so the CLI stays the single source of truth.
 
 import AppKit
+import ServiceManagement
 
 let cliPath = ["/opt/homebrew/bin/lich", "/usr/local/bin/lich"]
     .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/local/bin/lich"
@@ -43,6 +44,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        autoRegisterLoginItemOnce()
+    }
+
+    // Enroll as a login item on first launch only (macOS notifies the user
+    // and lists it in System Settings > Login Items). The right-click menu
+    // has a "Start at Login" toggle; respect it after the first launch.
+    var loginItemEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    func autoRegisterLoginItemOnce() {
+        let key = "didAutoRegisterLoginItem"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        try? SMAppService.mainApp.register()
+        UserDefaults.standard.set(true, forKey: key)
+    }
+
+    @objc func toggleLoginItem() {
+        if loginItemEnabled {
+            try? SMAppService.mainApp.unregister()
+        } else {
+            try? SMAppService.mainApp.register()
+        }
     }
 
     func refresh() {
@@ -75,6 +97,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             withTitle: risen ? "Lay to rest (off)" : "Raise the lich (on)",
             action: #selector(toggle), keyEquivalent: "")
         toggleItem.target = self
+        let loginItem = menu.addItem(
+            withTitle: "Start at Login",
+            action: #selector(toggleLoginItem), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = loginItemEnabled ? .on : .off
         let quitItem = menu.addItem(
             withTitle: "Quit Lich",
             action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
