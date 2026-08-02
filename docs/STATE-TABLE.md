@@ -242,7 +242,7 @@ com.apple.screensaver` returns only `tokenRemovalAction`, with no
 | Console already locked when the lid closes | No second lock, no log line | Yes — `console_locked \|\|` guard (lich:135) | Should-work |
 | ScreenSaverEngine fails to launch | Nothing locks, and the log still prints "lid closed while risen — screen locked" | Partial — `lock_console` is `\|\| true` (lich:84) and the log line is unconditional | Known-gap (log lies) |
 | Lid closed with an external display attached (clamshell desk setup) | macOS keeps working on the external display; lich locks the console anyway. Security-correct, possibly unwanted | Yes — code makes no exception for external displays | Untested → **Q10** |
-| Lid closed while risen but on **battery** | No lich lock; macOS sleeps and applies its own lock policy | Yes — gated on `sleep_disabled == 1` | Should-work |
+| Lid closed while risen but on **battery** | No lich lock; macOS sleeps and applies its own lock policy | Yes — gated on `sleep_disabled == 1` | **Tested** — field-verified 2026-08-02: lid closed on AC, then unplugged; log shows `power=battery roam=off -> disablesleep=0` at 17:04:18, machine slept (log gap), re-armed on AC return at 17:10:49 |
 | Lid opened, then closed again | Locks again — the latch resets when the lid opens | Yes — lich:138-139 | Should-work |
 | Desktop Mac / no clamshell sensor (Mac mini, Studio, iMac) | `lid_closed` never true → no lock path; `disablesleep` still applies, so lich becomes "never sleeps on AC" | Yes, incidentally — `ioreg` returns nothing (lich:77) | Untested (out of scope — MacBook tool) |
 | Lid already closed when `lich on` runs (ssh) | First tick sees closed + risen → locks. Correct | Yes — `LID_WAS_CLOSED` starts at 0 | Should-work |
