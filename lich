@@ -74,11 +74,28 @@ FLOOR_SUSPEND_LOGGED=0      # always-mode floor suspension: log once, not 12/min
 BATTERY_UNREADABLE_LOGGED=0 # ditto for an unparsable battery reading
 BATTERY_PCT=100             # last reading; set by read_battery, never read raw
 
-log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
-# Same log, on stderr. Under launchd both streams land in $LOG_FILE, so this
-# still gets written down — but it stays out of stdout, which `roam status`
-# and `config` promise to keep machine-readable.
-log_warn() { log "$*" >&2; }
+# Every log line goes to $LOG_FILE directly, no matter who called — watcher,
+# CLI, menu bar app (which discards CLI output), Control-Center-triggered
+# ticks. That makes the log a complete, timestamped history of every state
+# transition, usable as evidence when marking docs/STATE-TABLE.md rows Tested.
+# Terminal echo only when interactive; under launchd stdout is already the
+# log file and echoing would double every line.
+log() {
+  local line
+  line="$(printf '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$*")"
+  { mkdir -p "$(dirname "$LOG_FILE")" && printf '%s\n' "$line" >> "$LOG_FILE"; } 2>/dev/null || true
+  [[ -t 1 ]] && printf '%s\n' "$line"
+  return 0
+}
+# Same, but the interactive echo goes to stderr — stdout stays clean for the
+# machine-readable commands (`roam status`, `config`).
+log_warn() {
+  local line
+  line="$(printf '%s %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$*")"
+  { mkdir -p "$(dirname "$LOG_FILE")" && printf '%s\n' "$line" >> "$LOG_FILE"; } 2>/dev/null || true
+  [[ -t 2 ]] && printf '%s\n' "$line" >&2
+  return 0
+}
 die() { echo "lich: $*" >&2; exit 1; }
 
 # ---------- state probes ----------------------------------------------------
@@ -422,6 +439,7 @@ warn_no_watcher() {
 
 cmd_on() {
   raise
+  log "cmd: on"
   echo "💀 lich risen — lid-close keeps this Mac awake while on AC power"
   warn_no_watcher
 }
@@ -432,6 +450,7 @@ cmd_off() {
   # Also restore sleep directly, so `lich off` is instant and works even with
   # no watcher. Best-effort: the flag is what matters.
   sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
+  log "cmd: off"
   echo "⚰️  lich at rest — normal sleep behavior restored"
 }
 
@@ -454,6 +473,7 @@ cmd_roam() {
       ;;
     off)
       roam_set off
+      log "cmd: roam off"
       echo "roam off — unplugging lays the lich to rest again"
       return 0
       ;;
@@ -464,11 +484,13 @@ cmd_roam() {
     ""|once)
       roam_set once
       raise
+      log "cmd: roam once"
       echo "💀 roaming once — risen without the phylactery until you plug back in (floor ${floor}%)"
       ;;
     always)
       roam_set always
       raise
+      log "cmd: roam always"
       echo "💀 roaming always — unplugging no longer rests the lich (floor ${floor}% still does)"
       ;;
     timer)
@@ -484,6 +506,7 @@ cmd_roam() {
         epoch=$(( $(date +%s) + mins * 60 ))
         roam_set "until $epoch"
         raise
+        log "cmd: roam ${mins}m (until $epoch)"
         echo "💀 roaming for ${mins} min — risen without the phylactery until $(date -r "$epoch" '+%H:%M') (floor ${floor}%)"
       else
         die "unknown roam mode: $arg (try: lich roam, roam always, roam <minutes>, roam timer, roam off, roam status)"
@@ -500,6 +523,7 @@ cmd_done() {
   case "$(roam_mode)" in
     once|'until '*)
       roam_set off
+      log "cmd: done (roam cleared)"
       echo "roam cleared — this Mac may sleep again once unplugged (still risen; 'lich off' to rest)"
       ;;
     always)
@@ -795,8 +819,9 @@ EOF
     echo "with 'sudo visudo -f $SUDOERS':"
     echo "  $USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1"
   fi
-  echo "(The menu bar app and Control Center toggle are separate source builds — see README.)"
+  echo "(The Control Center toggle is a separate, optional source build — see README.)"
 
+  log "cmd: install (sudoers=$st_sudoers link=$st_link flag=$st_flag plist=$st_plist agent=$st_agent app=$st_app)"
   set -e
   [[ "$st_sudoers" == ok ]]
 }
@@ -808,6 +833,7 @@ cmd_upgrade() {
   # update produced and restart the watcher onto the new code.
   local self dir
   self="$(/usr/bin/readlink -f "$0" 2>/dev/null || echo "$0")"
+  log "cmd: upgrade"
   case "$self" in
     */Cellar/lichbook/*|*/opt/lichbook/*)
       echo "Homebrew install — updating via brew…"
@@ -842,6 +868,16 @@ cmd_upgrade() {
   fi
 }
 
+# The evidence trail, on demand. Every state change from every front end lands
+# in one file; this is how state-table rows graduate from Should-work to
+# Tested — do the thing, then read what actually happened.
+cmd_log() {
+  local n="${1:-25}"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "usage: lich log [lines]"
+  [[ -f "$LOG_FILE" ]] || die "no log yet at $LOG_FILE"
+  tail -n "$n" "$LOG_FILE"
+}
+
 cmd_reload() {
   # Restart the watcher so it picks up updated code — the running process is
   # still the old script, so `brew upgrade lichbook` alone changes nothing.
@@ -857,6 +893,7 @@ cmd_uninstall() {
   # Order matters: rest the flag and stop the watcher, restore normal sleep
   # while we still have the sudoers rule, and only then remove it. Every step
   # is best-effort so a half-installed machine can still be cleaned up.
+  log "cmd: uninstall"
   echo off > "$FLAG" 2>/dev/null || true
   launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
   sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
@@ -887,6 +924,8 @@ usage: lich [command]     (bare `lich` = status)
   status     show risen state, power source, sleep setting, roam mode,
              battery vs. floor, watcher health
              -q, --quiet  print nothing; exit 0 if risen, non-zero if at rest
+  log [n]    last n log lines (default 25) — every state change from every
+             front end, timestamped; the evidence trail
   roam       stay risen unplugged for one trip, and raise if at rest
              roam always   every unplug, until you turn it off
              roam <N>      for N minutes (45 or 45m); also: roam timer,
@@ -930,6 +969,7 @@ case "${1:-status}" in
   on)        cmd_on ;;
   off)       cmd_off ;;
   status)    cmd_status "${2:-}" ;;
+  log)       cmd_log "${2:-}" ;;
   roam)      cmd_roam "${2:-}" ;;
   done)      cmd_done ;;
   config)    cmd_config "${2:-}" "${3:-}" ;;
