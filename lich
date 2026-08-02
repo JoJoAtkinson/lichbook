@@ -1,0 +1,259 @@
+#!/bin/bash
+# lich — keep a MacBook awake with the lid closed, but ONLY while it is
+# plugged in AND you are logged in. Unplug it, log out, or lay it to rest,
+# and it sleeps like any mortal machine.
+#
+# The lore is the spec: the power cord is the phylactery. While it feeds the
+# machine, the lich stays risen — lid open or closed. Sever the phylactery
+# (unplug), or let the soul depart (log out), and the body returns to rest.
+#
+# How it works, in one paragraph:
+#   `lich install` loads a per-user LaunchAgent that runs `lich watch`.
+#   The watcher reads the risen/at-rest flag in ~/.lich/desired-state and
+#   listens to macOS power-source events (`pmset -g pslog`), flipping the
+#   hidden `pmset disablesleep` setting: 1 when risen AND on AC power
+#   (lid-close no longer sleeps), 0 otherwise. `lich on|off` just writes the
+#   flag — so anything that can write a file (the menu bar app, the Control
+#   Center toggle, an ssh session) can control it. Because the watcher is a
+#   per-user LaunchAgent it only exists while you're logged in — at logout
+#   launchd sends SIGTERM and the cleanup trap re-enables normal sleep. The
+#   only privileged operation is `pmset -a disablesleep 0|1`, allowed
+#   passwordlessly via a sudoers rule scoped to exactly those two commands.
+#
+# Inspired by: tmad4000/nosleep (scoped sudoers, cleanup traps),
+# Moarram/wake (minimal pmset wrapping), hizzt/mac-sleep-tool
+# (power-event-driven LaunchAgent — plus fixing its missing logout reset).
+
+set -euo pipefail
+
+LABEL="com.lichbook.watcher"
+CLI_LINK="/usr/local/bin/lich"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SUDOERS="/etc/sudoers.d/lichbook"
+LOG_FILE="$HOME/Library/Logs/lich.log"
+STATE_DIR="$HOME/.lich"            # sandboxed Control Center widget writes here
+FLAG="$STATE_DIR/desired-state"    # contents: "on" (risen) or "off" (at rest)
+PMSET="/usr/bin/pmset"
+POLL_FALLBACK=5   # seconds between wake-ups when no power event fires; also
+                  # the worst-case delay for a flag flip to take effect
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+die() { echo "lich: $*" >&2; exit 1; }
+
+# ---------- state probes ----------------------------------------------------
+
+on_ac() { "$PMSET" -g ps | head -1 | grep -q "AC Power"; }
+
+power_source() { on_ac && echo "AC (phylactery intact)" || echo "battery"; }
+
+risen() { [[ "$(cat "$FLAG" 2>/dev/null)" == "on" ]]; }
+
+sleep_disabled() {
+  local v
+  v="$("$PMSET" -g | awk '/SleepDisabled/ {print $2}')"
+  echo "${v:-0}"
+}
+
+watcher_running() { launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; }
+
+# ---------- watcher (runs under launchd; not meant to be called by hand) ----
+
+reconcile() {
+  local want=0
+  risen && on_ac && want=1
+  [[ "$(sleep_disabled)" == "$want" ]] && return 0
+  if sudo -n "$PMSET" -a disablesleep "$want" 2>/dev/null; then
+    log "risen=$(risen && echo yes || echo no) power=$(power_source) -> disablesleep=$want"
+  else
+    log "ERROR: 'sudo pmset' refused — sudoers rule missing? Run: lich install"
+    exit 78   # EX_CONFIG: launchd will retry, log stays honest
+  fi
+}
+
+cleanup() {
+  # Runs on any exit, including the SIGTERM launchd sends at logout —
+  # this is what guarantees a mortal Mac when we're gone.
+  sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
+  [[ -n "${PSLOG_PID:-}" ]] && kill "$PSLOG_PID" 2>/dev/null || true
+  log "watcher down — normal sleep restored"
+}
+
+cmd_watch() {
+  trap cleanup EXIT INT TERM
+  log "watcher up (pid $$)"
+
+  # Stream power-source change events on fd 3 so plug/unplug reacts instantly;
+  # the short read timeout is what picks up flag-file flips (worst case
+  # POLL_FALLBACK seconds) and doubles as a periodic safety-net reconcile.
+  exec 3< <("$PMSET" -g pslog)
+  PSLOG_PID=$!
+
+  reconcile
+  while :; do
+    rc=0
+    IFS= read -r -t "$POLL_FALLBACK" _ <&3 || rc=$?
+    if (( rc > 0 && rc <= 128 )); then
+      # EOF, not timeout: pslog died. Exit; launchd (KeepAlive) restarts us.
+      log "power event stream ended — restarting"
+      exit 1
+    fi
+    reconcile
+  done
+}
+
+# ---------- user commands ---------------------------------------------------
+
+cmd_on() {
+  mkdir -p "$STATE_DIR"
+  echo on > "$FLAG"
+  reconcile   # apply immediately rather than waiting for the watcher's tick
+  echo "💀 lich risen — lid-close keeps this Mac awake while on AC power"
+  watcher_running || echo "warning: watcher not running — run: lich install" >&2
+}
+
+cmd_off() {
+  mkdir -p "$STATE_DIR"
+  echo off > "$FLAG"
+  sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
+  echo "⚰️  lich at rest — normal sleep behavior restored"
+}
+
+cmd_status() {
+  local quiet="${1:-}"
+  if [[ "$quiet" == "--quiet" || "$quiet" == "-q" ]]; then
+    risen; exit $?
+  fi
+  if risen; then
+    echo "lich:    💀 risen"
+  else
+    echo "lich:    ⚰️  at rest"
+  fi
+  echo "power:   $(power_source)"
+  if [[ "$(sleep_disabled)" == "1" ]]; then
+    echo "sleep:   disabled — lid-close keeps the Mac awake"
+  else
+    echo "sleep:   normal — lid-close sleeps"
+  fi
+  watcher_running && echo "watcher: running" || echo "watcher: NOT running (run: lich install)"
+}
+
+cmd_install() {
+  local self tmp
+  self="$(/usr/bin/readlink -f "$0" 2>/dev/null || echo "$0")"
+  # Homebrew installs resolve into a versioned Cellar path that changes on
+  # every upgrade — point launchd at brew's stable opt/ symlink instead.
+  if [[ "$self" == */Cellar/lichbook/* ]]; then
+    self="${self%%/Cellar/*}/opt/lichbook/bin/lich"
+  fi
+
+  echo "This sets up (sudo will prompt once):"
+  echo "  1. $SUDOERS — passwordless sudo for EXACTLY two commands:"
+  echo "       pmset -a disablesleep 0   and   pmset -a disablesleep 1"
+  echo "  2. lich on your PATH (skipped if it already is, e.g. via Homebrew)"
+  echo "  3. $PLIST (per-user LaunchAgent, loaded now)"
+  echo "  4. $FLAG (risen/at-rest flag, starts at rest)"
+  echo
+
+  # 1. Scoped sudoers rule, validated with visudo before it goes live.
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+# lichbook: allow toggling lid-close sleep without a password.
+# Scoped to exactly these two commands — nothing else.
+$USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1
+EOF
+  sudo /usr/sbin/visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "generated sudoers failed validation — aborting, nothing installed"; }
+  sudo install -o root -g wheel -m 0440 "$tmp" "$SUDOERS"
+  rm -f "$tmp"
+
+  # 2. Register the command (skipped when already on PATH, e.g. Homebrew).
+  if ! command -v lich >/dev/null 2>&1; then
+    sudo mkdir -p "$(dirname "$CLI_LINK")"
+    sudo ln -sf "$self" "$CLI_LINK"
+  fi
+
+  # 3. State flag (default: at rest).
+  mkdir -p "$STATE_DIR"
+  [[ -f "$FLAG" ]] || echo off > "$FLAG"
+
+  # 4. LaunchAgent (points at the stable /usr/local/bin path), loaded now.
+  mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG_FILE")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$self</string>
+        <string>watch</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$LOG_FILE</string>
+    <key>StandardErrorPath</key><string>$LOG_FILE</string>
+</dict>
+</plist>
+EOF
+  launchctl enable "gui/$UID/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null || launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null || true
+
+  echo "Installed. Raise it with: lich on"
+}
+
+cmd_reload() {
+  # Restart the watcher so it picks up updated code (e.g. after brew upgrade).
+  if launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null; then
+    echo "watcher reloaded"
+  else
+    die "watcher not loaded — run: lich install"
+  fi
+}
+
+cmd_uninstall() {
+  echo off > "$FLAG" 2>/dev/null || true
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+  sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
+  rm -f "$PLIST"
+  rm -rf "$STATE_DIR"
+  sudo rm -f "$SUDOERS"
+  # Only remove /usr/local/bin/lich if it's the symlink we created —
+  # a Homebrew-managed binary is brew uninstall's job.
+  [[ -L "$CLI_LINK" ]] && sudo rm -f "$CLI_LINK" || true
+  echo "lich uninstalled — the Mac is mortal again"
+}
+
+cmd_help() {
+  cat <<'EOF'
+lich — your MacBook, undead. Lid closed, plugged in, still working.
+
+usage: lich [command]     (bare `lich` = status)
+
+  on         raise: stay awake with lid closed while on AC power
+  off        rest: normal sleep behavior
+  status     show risen state, power source, sleep setting, watcher health
+  install    one-time setup (scoped sudoers rule, /usr/local/bin/lich,
+             LaunchAgent watcher, ~/.lich state flag)
+  reload     restart the watcher (after updating lich, e.g. brew upgrade)
+  uninstall  remove everything lich installed
+  watch      internal: the launchd watcher loop
+
+While risen: plugged in + logged in = never sleeps, lid open or closed.
+On battery, or logged out, or at rest: sleeps like a normal Mac.
+The power cord is the phylactery — sever it and the lich rests.
+The flag lives in ~/.lich/desired-state ("on"/"off") — the menu bar app and
+Control Center toggle flip the same flag. Log: ~/Library/Logs/lich.log
+EOF
+}
+
+case "${1:-status}" in
+  on)        cmd_on ;;
+  off)       cmd_off ;;
+  status)    cmd_status "${2:-}" ;;
+  watch)     cmd_watch ;;
+  install)   cmd_install ;;
+  reload)    cmd_reload ;;
+  uninstall) cmd_uninstall ;;
+  help|-h|--help) cmd_help ;;
+  *) die "unknown command: $1 (try: lich help)" ;;
+esac
