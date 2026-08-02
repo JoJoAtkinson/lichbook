@@ -135,6 +135,13 @@ cmd_status() {
     echo "sleep:   normal — lid-close sleeps"
   fi
   watcher_running && echo "watcher: running" || echo "watcher: NOT running (run: lich install)"
+  if ! risen; then
+    echo
+    echo "raise it: lich on    (stays awake with the lid closed while plugged in)"
+  elif ! on_ac; then
+    echo
+    echo "note: on battery — the lich rests until the phylactery (AC power) returns"
+  fi
 }
 
 cmd_install() {
