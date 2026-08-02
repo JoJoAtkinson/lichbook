@@ -184,9 +184,12 @@ Running from a clone works the same: `./lich install`, then `lich on`.
 
 ## Optional: menu bar app
 
-Left-click toggles 💀 risen / ⚰️ at rest; right-click gives status lines, a
-toggle, three roaming checkboxes, a "Start at Login" checkbox, and Quit. It
-shells out to the `lich` CLI, so the CLI stays the single source of truth.
+The icon is a status light — 💀 risen, ⚰️ at rest — and any click opens the
+menu: live status lines, then checkboxes for **Awake** (the tool itself),
+the three roaming modes, and **Start at Login**, plus Quit. Numbers like the
+battery floor and timer minutes stay in `lich config`; the menu just
+reflects them. It shells out to the `lich` CLI, so the CLI stays the single
+source of truth.
 
 The roaming checkboxes are the three modes, in plain English:
 

@@ -1,7 +1,9 @@
-// LichMenuBar — a menu bar toggle for the `lich` CLI.
+// LichMenuBar — a menu bar control panel for the `lich` CLI.
 //
-// Left-click the icon: toggle risen (💀) / at rest (⚰️).
-// Right-click (or option-click): status details, roaming, Start at Login, Quit.
+// The icon is a status light: 💀 risen / ⚰️ at rest. Any click opens the
+// menu: live status lines, then checkboxes — Awake (the tool), the three
+// roam modes, Start at Login — and Quit. Numbers (battery floor, timer
+// minutes) are deliberately CLI-only (`lich config`); the menu reflects them.
 //
 // Why it exists: `lich on|off|status` is the whole product, but a docked
 // machine deserves a one-click way to raise and lay it to rest without
@@ -153,14 +155,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             : "lich: at rest — normal sleep"
     }
 
-    // One button, two behaviours. Assigning a menu to the NSStatusItem would
-    // make *every* click open the menu, so the button keeps its action and we
-    // decide from the event which gesture we got.
+    // Any click opens the menu. A click-to-toggle icon looks like a mystery
+    // button — nothing advertises that a menu exists — so the icon is a pure
+    // status light (💀/⚰️) and every control lives one click away where it
+    // can be read before it's flipped.
     @objc func clicked() {
-        let event = NSApp.currentEvent
-        let wantsMenu = event?.type == .rightMouseUp
-            || event?.modifierFlags.contains(.option) == true
-        wantsMenu ? showMenu() : toggle()
+        showMenu()
     }
 
     @objc func toggle() {
@@ -200,10 +200,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(withTitle: String(line), action: nil, keyEquivalent: "")
         }
         menu.addItem(.separator())
+        // The tool itself, as a checkbox like everything below it — checked
+        // means risen. Same state the icon shows, one click to flip.
         let toggleItem = menu.addItem(
-            withTitle: risen ? "Lay to rest (off)" : "Raise the lich (on)",
+            withTitle: "Awake — lid closed, plugged in",
             action: #selector(toggle), keyEquivalent: "")
         toggleItem.target = self
+        toggleItem.state = risen ? .on : .off
 
         // Roaming, in plain English — no lore in the labels, because the thing
         // a user is choosing here is "don't sleep when I unplug". One read of
@@ -236,10 +239,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quitItem.target = NSApp
 
-        // Attach, click to pop it open, then detach on the next runloop turn
-        // so the *next* left-click toggles again instead of reopening the
-        // menu. Clearing it synchronously would cancel the menu we just asked
-        // for; the async hop lands after it has been presented.
+        // Attach, click to pop it open, then detach on the next runloop turn.
+        // The menu is rebuilt on every open (fresh status lines, fresh
+        // checkmarks), so it must not stay attached between opens. Clearing it
+        // synchronously would cancel the menu we just asked for; the async hop
+        // lands after it has been presented.
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         DispatchQueue.main.async { self.statusItem.menu = nil }
