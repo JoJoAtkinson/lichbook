@@ -586,6 +586,28 @@ cmd_status() {
   fi
 }
 
+# Copy a built Lich.app into /Applications and (re)launch it. The app must
+# live at a stable path: it registers itself as a login item, and a pointer
+# into a versioned Cellar directory dies on the next upgrade. Sources, in
+# order: the brew prefix (the formula builds the app at install time, on this
+# machine, so its ad-hoc signature is trusted here) or a clone's menubar/
+# build. Quiet; returns 0 synced, 1 nothing to sync, 2 copy failed.
+sync_menubar_app() {
+  local self="$1" src=""
+  if [[ -d "${self%/bin/lich}/Lich.app" ]]; then
+    src="${self%/bin/lich}/Lich.app"
+  elif [[ -d "$(dirname "$self")/menubar/Lich.app" ]]; then
+    src="$(dirname "$self")/menubar/Lich.app"
+  else
+    return 1
+  fi
+  pkill -f lich-menubar 2>/dev/null
+  rm -rf /Applications/Lich.app 2>/dev/null
+  cp -R "$src" /Applications/Lich.app 2>/dev/null || return 2
+  open /Applications/Lich.app 2>/dev/null
+  return 0
+}
+
 cmd_install() {
   local self tmp
 
@@ -610,6 +632,7 @@ cmd_install() {
   set +e
 
   local st_sudoers=failed st_link=failed st_flag=failed st_plist=failed st_agent=failed
+  local st_app=skipped note_app=""
   local note_sudoers="" note_link="" note_flag="" note_plist="" note_agent="" have_sudo=0 i=0
 
   # Say it out loud first, in the order it happens. Anyone about to type their
@@ -620,6 +643,7 @@ cmd_install() {
   echo "  2. lich on your PATH (skipped if it already is, e.g. via Homebrew)"
   echo "  3. $FLAG (risen/at-rest flag, starts at rest)"
   echo "  4. $PLIST (per-user LaunchAgent, runs as you, loaded now)"
+  echo "  5. /Applications/Lich.app (menu bar 💀 — if a built copy is available)"
   echo
 
   # One credential prompt, up front. Declined or unavailable = the privileged
@@ -735,6 +759,16 @@ EOF
     fi
   fi
 
+  # 5. The menu bar app, when a built copy exists (the brew formula builds one
+  #    into its prefix; a clone has one after `make -C menubar`). Optional and
+  #    unprivileged — /Applications is admin-writable without sudo.
+  case "$(sync_menubar_app "$self"; echo $?)" in
+    0) st_app=ok ;;
+    1) note_app="no built app found (from a clone: make -C menubar, then re-run)" ;;
+    *) st_app=failed note_app="could not copy into /Applications"
+       echo "lich: warning: menu bar app: $note_app" >&2 ;;
+  esac
+
   # ---- summary (the only way install ends) ----------------------------------
   echo
   echo "install summary:"
@@ -743,6 +777,7 @@ EOF
   printf '  %-8s state flag%s\n'    "$st_flag"    "${note_flag:+ — $note_flag}"
   printf '  %-8s watcher plist%s\n' "$st_plist"   "${note_plist:+ — $note_plist}"
   printf '  %-8s watcher agent%s\n' "$st_agent"   "${note_agent:+ — $note_agent}"
+  printf '  %-8s menu bar app%s\n'  "$st_app"     "${note_app:+ — $note_app}"
   echo
   if [[ "$st_sudoers" == ok && "$st_agent" == ok ]]; then
     echo "All set. Raise it with: lich on"
@@ -766,6 +801,47 @@ EOF
   [[ "$st_sudoers" == ok ]]
 }
 
+cmd_upgrade() {
+  # One update command for both install styles. Detect which this is from
+  # where the script actually lives: brew keeps it under Cellar/opt, a clone
+  # is a git worktree. Then refresh the /Applications app from whatever the
+  # update produced and restart the watcher onto the new code.
+  local self dir
+  self="$(/usr/bin/readlink -f "$0" 2>/dev/null || echo "$0")"
+  case "$self" in
+    */Cellar/lichbook/*|*/opt/lichbook/*)
+      echo "Homebrew install — updating via brew…"
+      # `brew update` refreshes the tap (the formula lives in the repo, so a
+      # new release is invisible until the tap is pulled).
+      brew update >/dev/null 2>&1 || true
+      brew upgrade lichbook 2>&1 || echo "(already up to date)"
+      # The old Cellar dir this process resolved from may be gone now — use
+      # the stable opt path for everything after this point.
+      self="${self%%/Cellar/*}/opt/lichbook/bin/lich"
+      [[ "$self" == */opt/lichbook/* ]] || self="$(command -v lich || echo "$0")"
+      ;;
+    *)
+      dir="$(dirname "$self")"
+      if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "Clone install — pulling…"
+        git -C "$dir" pull --ff-only || die "git pull failed — resolve by hand in $dir"
+        # Rebuild the menu bar app if the toolchain is here; fail open if not.
+        command -v swiftc >/dev/null 2>&1 && make -C "$dir/menubar" >/dev/null 2>&1
+      else
+        die "can't tell how this was installed (not brew, not a git clone) — update by hand"
+      fi
+      ;;
+  esac
+  if sync_menubar_app "$self"; then
+    echo "menu bar app refreshed"
+  fi
+  if launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null; then
+    echo "watcher reloaded — running the new code"
+  else
+    echo "watcher not loaded (run: lich install)" >&2
+  fi
+}
+
 cmd_reload() {
   # Restart the watcher so it picks up updated code — the running process is
   # still the old script, so `brew upgrade lichbook` alone changes nothing.
@@ -786,6 +862,10 @@ cmd_uninstall() {
   sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
   rm -f "$PLIST"
   rm -rf "$STATE_DIR"
+  # The menu bar app, if install put it there. The Control Center widget
+  # (LichToggle.app) is never install's to manage, so it is never removed here.
+  pkill -f lich-menubar 2>/dev/null || true
+  rm -rf /Applications/Lich.app 2>/dev/null || true
   sudo rm -f "$SUDOERS"
   # The PATH entry — but only if WE made it. On an Intel Mac the Homebrew
   # prefix is also /usr/local, so brew's own symlink (which points into the
@@ -822,7 +902,9 @@ usage: lich [command]     (bare `lich` = status)
   install    one-time setup, prompts for sudo once: sudoers rule scoped to
              two pmset commands, ~/.lich state flag, LaunchAgent watcher, and
              /usr/local/bin/lich unless lich is already on PATH
-  reload     restart the watcher (after updating lich, e.g. brew upgrade)
+  upgrade    update lich (brew or git clone, auto-detected), refresh the
+             menu bar app, and reload the watcher — the whole update, one word
+  reload     restart the watcher only (upgrade runs this for you)
   uninstall  remove all of that and restore normal sleep
   watch      internal: the launchd watcher loop, not for hand use
   help       this text
@@ -853,6 +935,7 @@ case "${1:-status}" in
   config)    cmd_config "${2:-}" "${3:-}" ;;
   watch)     cmd_watch ;;
   install)   cmd_install ;;
+  upgrade)   cmd_upgrade ;;
   reload)    cmd_reload ;;
   uninstall) cmd_uninstall ;;
   help|-h|--help) cmd_help ;;

@@ -27,10 +27,12 @@ lich on       # 💀 risen — lid-close keeps the Mac awake while on AC
 lich off      # ⚰️ at rest — normal sleep
 ```
 
-Both states persist across logins. Upgrade with:
+Both states persist across logins. Updating is one word — it detects whether
+you installed via brew or a clone, updates accordingly, refreshes the menu
+bar app, and reloads the watcher:
 
 ```sh
-brew upgrade lichbook && lich reload
+lich upgrade
 ```
 
 ## Roaming: staying awake on battery
@@ -182,7 +184,14 @@ one-shot, an expired timer, or a roam that hit the floor.
 
 Running from a clone works the same: `./lich install`, then `lich on`.
 
-## Optional: menu bar app
+## Menu bar app
+
+Installed for you: the brew formula builds `Lich.app` on your machine during
+`brew install` (ad-hoc signing only trusts locally-built code — this is why
+there's no prebuilt download), and `lich install` copies it to /Applications
+and launches it. From a clone, `make -C menubar` first, then `lich install`
+picks it up the same way. If the build isn't there, install just says so and
+everything else works — the app is optional.
 
 The icon is a status light — 💀 risen, ⚰️ at rest — and any click opens the
 menu: live status lines, then checkboxes for **Awake** (the tool itself),
@@ -203,13 +212,8 @@ turns roaming off. Durations are set with `lich config roam_mins` and nowhere
 else — the menu stays a switch, not a settings panel. The battery floor
 applies here exactly as it does from the CLI.
 
-```sh
-cd menubar && make install
-open /Applications/Lich.app
-```
-
 It registers itself as a login item on first launch (SMAppService); uncheck
-"Start at Login" in the right-click menu if you'd rather it didn't.
+"Start at Login" in its menu if you'd rather it didn't.
 
 ## Optional: Control Center toggle
 
