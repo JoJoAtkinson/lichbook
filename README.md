@@ -21,8 +21,8 @@ running on a docked laptop, close the lid, and keep prompting.
 | — | ❌ | — | sleeps |
 | — | — | ❌ | sleeps |
 
-Unplugging while the lid is closed puts it to sleep within a second or two —
-the watcher reacts to power events, it doesn't poll.
+Unplugging while the lid is closed puts it to sleep within ~5 seconds (the
+watcher checks power and the flag every 5 seconds).
 
 ## Install
 
@@ -83,16 +83,17 @@ watcher applies it within ~5 seconds. Anything else that can write a file
 One bash script (`lich`, ~200 lines — read it) plus one per-user
 LaunchAgent:
 
-- The agent runs `lich watch`, which streams macOS power-source events
-  (`pmset -g pslog`), reads the risen flag, and flips the hidden
-  `pmset disablesleep` setting: `1` when risen and on AC power, `0` otherwise.
-  `disablesleep` is the only mechanism that blocks clamshell (lid-close)
-  sleep — `caffeinate` cannot.
+- The agent runs `lich watch`, which every 5 seconds reads the risen flag
+  and the power source, and flips the hidden `pmset disablesleep` setting:
+  `1` when risen and on AC power, `0` otherwise. `disablesleep` is the only
+  mechanism that blocks clamshell (lid-close) sleep — `caffeinate` cannot.
+  (Plain polling is deliberate: `pmset -g pslog` event streaming is
+  unreliable under launchd.)
 - **Logged-in condition is free:** per-user LaunchAgents only run while you're
   logged in. At logout launchd sends SIGTERM and the cleanup trap restores
   `disablesleep 0` before the process dies.
-- A 5-second fallback reconcile catches anything the event stream misses, and
-  `KeepAlive` restarts the watcher if it ever dies.
+- `KeepAlive` restarts the watcher if it ever dies, and the cleanup trap
+  restores normal sleep on any exit.
 
 ### What install does
 

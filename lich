@@ -9,9 +9,9 @@
 #
 # How it works, in one paragraph:
 #   `lich install` loads a per-user LaunchAgent that runs `lich watch`.
-#   The watcher reads the risen/at-rest flag in ~/.lich/desired-state and
-#   listens to macOS power-source events (`pmset -g pslog`), flipping the
-#   hidden `pmset disablesleep` setting: 1 when risen AND on AC power
+#   Every 5 seconds the watcher reads the risen/at-rest flag in
+#   ~/.lich/desired-state and the power source, and flips the hidden
+#   `pmset disablesleep` setting: 1 when risen AND on AC power
 #   (lid-close no longer sleeps), 0 otherwise. `lich on|off` just writes the
 #   flag — so anything that can write a file (the menu bar app, the Control
 #   Center toggle, an ssh session) can control it. Because the watcher is a
@@ -34,8 +34,8 @@ LOG_FILE="$HOME/Library/Logs/lich.log"
 STATE_DIR="$HOME/.lich"            # sandboxed Control Center widget writes here
 FLAG="$STATE_DIR/desired-state"    # contents: "on" (risen) or "off" (at rest)
 PMSET="/usr/bin/pmset"
-POLL_FALLBACK=5   # seconds between wake-ups when no power event fires; also
-                  # the worst-case delay for a flag flip to take effect
+POLL_INTERVAL=5   # seconds between checks; the worst-case delay for a flag
+                  # flip or plug/unplug to take effect
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() { echo "lich: $*" >&2; exit 1; }
@@ -74,7 +74,6 @@ cleanup() {
   # Runs on any exit, including the SIGTERM launchd sends at logout —
   # this is what guarantees a mortal Mac when we're gone.
   sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
-  [[ -n "${PSLOG_PID:-}" ]] && kill "$PSLOG_PID" 2>/dev/null || true
   log "watcher down — normal sleep restored"
 }
 
@@ -82,22 +81,13 @@ cmd_watch() {
   trap cleanup EXIT INT TERM
   log "watcher up (pid $$)"
 
-  # Stream power-source change events on fd 3 so plug/unplug reacts instantly;
-  # the short read timeout is what picks up flag-file flips (worst case
-  # POLL_FALLBACK seconds) and doubles as a periodic safety-net reconcile.
-  exec 3< <("$PMSET" -g pslog)
-  PSLOG_PID=$!
-
-  reconcile
+  # Plain polling, on purpose: `pmset -g pslog` does not stream reliably
+  # under launchd (it exits after its header), and an event stream that can
+  # die takes disablesleep down with it. Two cheap pmset reads every
+  # POLL_INTERVAL seconds is robust and unnoticeable.
   while :; do
-    rc=0
-    IFS= read -r -t "$POLL_FALLBACK" _ <&3 || rc=$?
-    if (( rc > 0 && rc <= 128 )); then
-      # EOF, not timeout: pslog died. Exit; launchd (KeepAlive) restarts us.
-      log "power event stream ended — restarting"
-      exit 1
-    fi
     reconcile
+    sleep "$POLL_INTERVAL"
   done
 }
 
