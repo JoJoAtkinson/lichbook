@@ -106,6 +106,15 @@ log_warn() {
 }
 die() { echo "lich: $*" >&2; exit 1; }
 
+# Color, only when stdout is a terminal — pipes, logs and scripts get plain
+# text. C_ACT (bold yellow) marks THE COMMAND THE USER MUST RUN NEXT; that is
+# its whole job, so use it sparingly or it stops meaning anything.
+if [[ -t 1 ]]; then
+  C_ACT=$'\033[1;33m' C_OK=$'\033[32m' C_BAD=$'\033[31m' C_OFF=$'\033[0m'
+else
+  C_ACT="" C_OK="" C_BAD="" C_OFF=""
+fi
+
 # ---------- state probes ----------------------------------------------------
 # All read-only. Nothing in this section needs privileges.
 
@@ -493,7 +502,7 @@ raise() {
 # Worth saying loudly: with no watcher, nothing will undo any of this on
 # unplug, on a timer, or at the battery floor.
 warn_no_watcher() {
-  watcher_running || echo "warning: watcher not running — run: lich install" >&2
+  watcher_running || echo "warning: watcher not running — run: ${C_ACT}lich install${C_OFF}" >&2
 }
 
 cmd_on() {
@@ -677,7 +686,7 @@ cmd_status() {
   watcher_running && echo "watcher: running" || echo "watcher: NOT running (run: lich install)"
   if ! risen; then
     echo
-    echo "raise it: lich on    (stays awake with the lid closed while plugged in)"
+    echo "raise it: ${C_ACT}lich on${C_OFF}    (stays awake with the lid closed while plugged in)"
   elif ! on_ac; then
     echo
     if [[ "$(roam_state)" == "off" ]]; then
@@ -919,12 +928,12 @@ EOF
   printf '  %-8s menu bar app%s\n'  "$st_app"     "${note_app:+ — $note_app}"
   echo
   if [[ "$st_sudoers" == ok && "$st_agent" == ok ]]; then
-    echo "All set. Raise it with: lich on"
+    echo "All set. Raise it with: ${C_ACT}lich on${C_OFF}"
   elif [[ "$st_sudoers" == ok ]]; then
     echo "The CLI works right now — lich on/off apply the setting directly."
     echo "But with NO watcher, nothing reverts it for you: unplugging will NOT"
     echo "restore sleep, logout will NOT restore sleep, roam timers and the"
-    echo "battery floor do NOT run. For real protection keep 'lich watch'"
+    echo "battery floor do NOT run. For real protection keep ${C_ACT}lich watch${C_OFF}"
     echo "running in a terminal or tmux, and re-run 'lich install' after"
     echo "fixing the watcher (start with $LOG_FILE)."
   else
@@ -933,7 +942,7 @@ EOF
     echo "work. Fix: an ADMIN adds this rule (works for non-admin users too)"
     echo "with 'sudo visudo -f $SUDOERS':"
     echo "  $USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1"
-    echo "— then re-run 'lich install' as $USER: no password will be needed."
+    echo "— then re-run ${C_ACT}lich install${C_OFF} as $USER: no password will be needed."
   fi
   echo "(The Control Center toggle is a separate, optional source build — see README.)"
 

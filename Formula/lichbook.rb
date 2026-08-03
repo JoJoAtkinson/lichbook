@@ -39,12 +39,12 @@ class Lichbook < Formula
   # Keep it short: it prints on every install and upgrade.
   def caveats
     <<~EOS
-      First-time setup, two steps:
+      First-time setup, two steps — nothing works until you run them:
 
-        1. lich install    # one-time; ONE sudo prompt. Adds a sudoers rule
+        1. \e[1;33mlich install\e[0m    # one-time; ONE sudo prompt. Adds a sudoers rule
                            # scoped to exactly two pmset commands, plus a
                            # per-user watcher process.
-        2. lich on         # 💀 risen: lid-close no longer sleeps this Mac
+        2. \e[1;33mlich on\e[0m         # 💀 risen: lid-close no longer sleeps this Mac
                            # while it's plugged in and you're logged in
 
       Everyday use:
