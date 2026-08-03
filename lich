@@ -613,6 +613,7 @@ cmd_config() {
       # roam_mins from here to label its timer item, so it must always answer.
       echo "floor=$(config_get floor "$DEFAULT_FLOOR")"
       echo "roam_mins=$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
+      echo "no_app=$(config_get no_app 0)"
       ;;
     floor)
       [[ "$val" =~ ^[0-9]+$ ]] || die "config floor: need a whole number of percent (5-95)"
@@ -628,8 +629,16 @@ cmd_config() {
       config_set roam_mins "$val"
       echo "roam_mins=$val"
       ;;
+    no_app)
+      # CLI-only preference: 1 = install/upgrade never touch the menu bar
+      # app. Persisted like any standing setting, so an upgrade can't
+      # resurrect an interface the owner explicitly declined.
+      [[ "$val" == 0 || "$val" == 1 ]] || die "config no_app: 0 (install the menu bar app) or 1 (CLI only)"
+      config_set no_app "$val"
+      echo "no_app=$val"
+      ;;
     *)
-      die "unknown config key: $key (known: floor, roam_mins)"
+      die "unknown config key: $key (known: floor, roam_mins, no_app)"
       ;;
   esac
 }
@@ -702,6 +711,14 @@ sync_menubar_app() {
 
 cmd_install() {
   local self tmp
+  # `lich install --no-app` = CLI only. Persisted (config no_app=1), so
+  # upgrades respect the choice too; undo with `lich config no_app 0` and
+  # re-run install. The Control Center widget was already opt-in (`lich
+  # widget`); this makes the menu bar app declinable as well.
+  if [[ "${1:-}" == "--no-app" ]]; then
+    mkdir -p "$STATE_DIR"
+    config_set no_app 1
+  fi
 
   # Which copy of this script does launchd run forever? Resolve symlinks, so
   # the plist records a real file rather than a link that may be repointed.
@@ -853,13 +870,19 @@ EOF
 
   # 5. The menu bar app, when a built copy exists (the brew formula builds one
   #    into its prefix; a clone has one after `make -C menubar`). Optional and
-  #    unprivileged — /Applications is admin-writable without sudo.
-  case "$(sync_menubar_app "$self"; echo $?)" in
-    0) st_app=ok ;;
-    1) note_app="no built app found (from a clone: make -C menubar, then re-run)" ;;
-    *) st_app=failed note_app="could not copy into /Applications"
-       echo "lich: warning: menu bar app: $note_app" >&2 ;;
-  esac
+  #    unprivileged — /Applications is admin-writable without sudo — and
+  #    declinable: the persisted no_app preference skips it here and in
+  #    upgrades alike.
+  if [[ "$(config_get no_app 0)" == 1 ]]; then
+    note_app="declined (no_app=1; lich config no_app 0 to change)"
+  else
+    case "$(sync_menubar_app "$self"; echo $?)" in
+      0) st_app=ok ;;
+      1) note_app="no built app found (from a clone: make -C menubar, then re-run)" ;;
+      *) st_app=failed note_app="could not copy into /Applications"
+         echo "lich: warning: menu bar app: $note_app" >&2 ;;
+    esac
+  fi
 
   # ---- summary (the only way install ends) ----------------------------------
   echo
@@ -982,7 +1005,9 @@ cmd_upgrade() {
       fi
       ;;
   esac
-  if sync_menubar_app "$self"; then
+  if [[ "$(config_get no_app 0)" == 1 ]]; then
+    : # CLI-only by choice — never resurrect a declined interface
+  elif sync_menubar_app "$self"; then
     echo "menu bar app refreshed"
   fi
   if launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null; then
@@ -1068,8 +1093,11 @@ usage: lich [command]     (bare `lich` = status)
              config floor <5-95>        battery % where roaming ends
              config roam_mins <1-1440>  what 'roam timer' means
   install    one-time setup, prompts for sudo once: sudoers rule scoped to
-             two pmset commands, ~/.lich state flag, LaunchAgent watcher, and
-             /usr/local/bin/lich unless lich is already on PATH
+             two pmset commands, ~/.lich state flag, LaunchAgent watcher,
+             /usr/local/bin/lich unless lich is already on PATH, and the
+             menu bar app when a built copy is available
+             --no-app   CLI only — skip the menu bar app now and on every
+                        upgrade (persisted; lich config no_app 0 to undo)
   widget     build + add the optional Control Center toggle — needs full
              Xcode and xcodegen; warns and does nothing without them
              widget remove  take it back out
@@ -1106,7 +1134,7 @@ case "${1:-status}" in
   done)      cmd_done ;;
   config)    cmd_config "${2:-}" "${3:-}" ;;
   watch)     cmd_watch ;;
-  install)   cmd_install ;;
+  install)   cmd_install "${2:-}" ;;
   widget)    cmd_widget "${2:-}" ;;
   upgrade)   cmd_upgrade ;;
   reload)    cmd_reload ;;

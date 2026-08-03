@@ -219,6 +219,11 @@ and launches it. From a clone, `make -C menubar` first, then `lich install`
 picks it up the same way. If the build isn't there, install just says so and
 everything else works — the app is optional.
 
+**Prefer CLI only?** `lich install --no-app` skips the menu bar app — and
+the choice is persisted, so `lich upgrade` never resurrects an interface
+you declined. Change your mind later with `lich config no_app 0` and re-run
+`lich install`.
+
 The icon is a status light — 💀 risen, ⚰️ at rest — and any click opens the
 menu: live status lines, then checkboxes for **Awake** (the tool itself),
 the three roaming modes, and **Start at Login**, plus Quit. Numbers like the
