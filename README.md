@@ -35,6 +35,23 @@ bar app, and reloads the watcher:
 lich upgrade
 ```
 
+## What happens when… (the everyday cases)
+
+No sleep/wake theory required — while the lich is risen 💀:
+
+| You… | Your Mac… |
+|------|-----------|
+| leave it plugged in, lid closed | stays awake indefinitely — Claude sessions, ssh, automations all keep running, screen locked behind the closed lid |
+| finish up, close the lid, walk it over to the charger | wakes within seconds of the cord going in and *stays* awake — hours later, ask it something from your phone and it answers. The plug is the on-switch; the lid never needs to open |
+| use it plugged in, lid open | never dozes off mid-task — idle sleep is off while risen |
+| lock the screen (Ctrl+Cmd+Q, or just close the lid) | keeps working behind the password screen — **locked and asleep are different things**; your session and its work continue |
+| unplug it | goes back to being a normal laptop: sleeps shortly after you stop using it (unless you asked it to [roam](#roaming-staying-awake-on-battery)) |
+| log out, or run `lich off` | fully mortal — sleeps like lich was never installed |
+
+All of these are field-tested. Every state beyond them — crashes, battery
+floors, multiple users, the works — lives in the full
+[state table](docs/STATE-TABLE.md).
+
 ## Roaming: staying awake on battery
 
 Sometimes the work has to leave the desk — an agent mid-run you carry to the
