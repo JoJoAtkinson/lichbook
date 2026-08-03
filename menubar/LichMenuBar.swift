@@ -140,13 +140,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(true, forKey: key)
     }
 
-    @objc func toggleLoginItem() {
-        if loginItemEnabled {
-            try? SMAppService.mainApp.unregister()
-        } else {
-            try? SMAppService.mainApp.register()
-        }
-    }
 
     func refresh() {
         statusItem.button?.title = risen ? "💀" : "⚰️"
@@ -163,34 +156,78 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         showMenu()
     }
 
-    @objc func toggle() {
-        lich([risen ? "off" : "on"])
+    // ---- stay-open toggles -------------------------------------------------
+    // The toggle rows are real checkbox controls inside CUSTOM VIEWS, not
+    // plain menu items, for one reason: a plain NSMenuItem dismisses the menu
+    // the instant it's clicked, and a settings panel that vanishes the moment
+    // you use it forces a reopen just to confirm. Menu items that carry a
+    // view do NOT auto-dismiss — click, watch the checkmark (and the 💀/⚰️)
+    // change in place, then click anywhere outside (or press Esc) to close.
+    // The trade: these rows have no hover highlight. Quit stays a plain item
+    // and closes the menu like a menu item should.
+    private var menuToggles: [(button: NSButton, isOn: () -> Bool)] = []
+
+    private func addToggle(to menu: NSMenu, title: String,
+                           isOn: @escaping () -> Bool, action: Selector) {
+        let button = NSButton(checkboxWithTitle: title, target: self, action: action)
+        button.font = NSFont.menuFont(ofSize: 0)
+        button.state = isOn() ? .on : .off
+        button.sizeToFit()
+        let pad: CGFloat = 14
+        let view = NSView(frame: NSRect(x: 0, y: 0,
+                                        width: button.frame.width + pad * 2,
+                                        height: button.frame.height + 8))
+        button.setFrameOrigin(NSPoint(x: pad, y: 4))
+        view.addSubview(button)
+        let item = NSMenuItem()
+        item.view = view
+        menu.addItem(item)
+        menuToggles.append((button, isOn))
+    }
+
+    // After any toggle fires: re-ask the CLI for the truth and repaint every
+    // checkbox (standing modes are mutually exclusive, so one click can move
+    // two checkmarks) plus the status-light icon. The CLI remains the single
+    // source of truth — the checkbox you clicked shows what actually took,
+    // not what the click hoped for.
+    private func refreshToggles() {
         refresh()
+        for t in menuToggles { t.button.state = t.isOn() ? .on : .off }
     }
 
-    // The roam items are checkboxes, each its own off switch. The trip
-    // ("once") is cleared with `lich done` — which spares the standing
-    // setting by contract — while the two standing modes are cleared with
-    // `roam off`. Arming also raises the lich (the CLI does that), hence the
-    // refresh for the icon.
-    @objc func roamOnce(_ sender: NSMenuItem) {
-        armRoam(sender.state == .on ? ["done"] : ["roam"])
+    @objc func awakeToggled(_ sender: NSButton) {
+        lich([sender.state == .on ? "on" : "off"])
+        refreshToggles()
     }
 
-    @objc func roamAlways(_ sender: NSMenuItem) {
-        armRoam(sender.state == .on ? ["roam", "off"] : ["roam", "always"])
+    // The trip's off switch is `lich done` — which spares the standing
+    // setting by contract — while the standing modes clear with `roam off`.
+    @objc func tripToggled(_ sender: NSButton) {
+        lich(sender.state == .on ? ["roam"] : ["done"])
+        refreshToggles()
     }
 
-    @objc func roamTimer(_ sender: NSMenuItem) {
-        armRoam(sender.state == .on ? ["roam", "off"] : ["roam", "timer"])
+    @objc func alwaysToggled(_ sender: NSButton) {
+        lich(sender.state == .on ? ["roam", "always"] : ["roam", "off"])
+        refreshToggles()
     }
 
-    func armRoam(_ args: [String]) {
-        lich(args)
-        refresh()
+    @objc func timerToggled(_ sender: NSButton) {
+        lich(sender.state == .on ? ["roam", "timer"] : ["roam", "off"])
+        refreshToggles()
+    }
+
+    @objc func loginToggled(_ sender: NSButton) {
+        if sender.state == .on {
+            try? SMAppService.mainApp.register()
+        } else {
+            try? SMAppService.mainApp.unregister()
+        }
+        refreshToggles()
     }
 
     func showMenu() {
+        menuToggles.removeAll()
         let menu = NSMenu()
         // Rendered as disabled header lines: whatever `lich status` prints
         // (risen state, power source, sleep setting, watcher health) shows up
@@ -199,43 +236,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         for line in status.split(separator: "\n") {
             menu.addItem(withTitle: String(line), action: nil, keyEquivalent: "")
         }
-        menu.addItem(.separator())
-        // The tool itself, as a checkbox like everything below it — checked
-        // means risen. Same state the icon shows, one click to flip.
-        let toggleItem = menu.addItem(
-            withTitle: "Awake — lid closed, plugged in",
-            action: #selector(toggle), keyEquivalent: "")
-        toggleItem.target = self
-        toggleItem.state = risen ? .on : .off
-
-        // Roaming, in plain English — no lore in the labels, because the thing
-        // a user is choosing here is "don't sleep when I unplug". One read of
-        // the CLI feeds all three checkmarks so they can't disagree with each
-        // other mid-menu. Durations are deliberately not editable here: the
-        // minutes live in `lich config`, and this menu just reflects them.
-        menu.addItem(.separator())
-        let roam = roamState
-        let roamItems: [(String, Selector, Bool)] = [
-            ("Stay awake unplugged — this once", #selector(roamOnce(_:)), roam.hasTrip),
-            ("Stay awake unplugged — always", #selector(roamAlways(_:)), roam.standing == .always),
-            ("Stay awake unplugged — \(roamMins) min each time", #selector(roamTimer(_:)), roam.standing == .timer),
-        ]
-        for (title, action, checked) in roamItems {
-            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
-            item.target = self
-            item.state = checked ? .on : .off
-        }
 
         menu.addItem(.separator())
-        let loginItem = menu.addItem(
-            withTitle: "Start at Login",
-            action: #selector(toggleLoginItem), keyEquivalent: "")
-        loginItem.target = self
-        loginItem.state = loginItemEnabled ? .on : .off
+        // The tool itself — checked means risen, same state the icon shows.
+        addToggle(to: menu, title: "Awake — lid closed, plugged in",
+                  isOn: { [weak self] in self?.risen ?? false },
+                  action: #selector(awakeToggled(_:)))
+
+        // Roaming, in plain English — no lore in the labels, because the
+        // thing being chosen is "don't sleep when I unplug". Durations are
+        // deliberately not editable here: minutes live in `lich config`.
+        menu.addItem(.separator())
+        addToggle(to: menu, title: "Stay awake unplugged — this once",
+                  isOn: { [weak self] in self?.roamState.hasTrip ?? false },
+                  action: #selector(tripToggled(_:)))
+        addToggle(to: menu, title: "Stay awake unplugged — always",
+                  isOn: { [weak self] in self?.roamState.standing == .always },
+                  action: #selector(alwaysToggled(_:)))
+        addToggle(to: menu, title: "Stay awake unplugged — \(roamMins) min each time",
+                  isOn: { [weak self] in self?.roamState.standing == .timer },
+                  action: #selector(timerToggled(_:)))
+
+        menu.addItem(.separator())
+        addToggle(to: menu, title: "Start at Login",
+                  isOn: { [weak self] in self?.loginItemEnabled ?? false },
+                  action: #selector(loginToggled(_:)))
         let quitItem = menu.addItem(
             withTitle: "Quit Lich",
             action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quitItem.target = NSApp
+
+        // Same width for every toggle row, so the menu doesn't ripple.
+        let maxWidth = menuToggles.map { $0.button.frame.width + 28 }.max() ?? 0
+        for item in menu.items where item.view != nil {
+            item.view?.setFrameSize(NSSize(width: maxWidth,
+                                           height: item.view?.frame.height ?? 0))
+        }
 
         // Attach, click to pop it open, then detach on the next runloop turn.
         // The menu is rebuilt on every open (fresh status lines, fresh
