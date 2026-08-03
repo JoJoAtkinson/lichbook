@@ -47,7 +47,11 @@ set -euo pipefail
 LABEL="com.lichbook.watcher"
 CLI_LINK="/usr/local/bin/lich"     # only created if lich isn't already on PATH
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-SUDOERS="/etc/sudoers.d/lichbook"
+# Per-user filename, so a second user's install can never clobber the first
+# user's rule (each install/uninstall touches only its own file). Dots are
+# stripped because #includedir silently ignores filenames containing them.
+SUDOERS="/etc/sudoers.d/lichbook-${USER//./_}"
+SUDOERS_LEGACY="/etc/sudoers.d/lichbook"   # pre-v0.3.2 shared filename
 LOG_FILE="$HOME/Library/Logs/lich.log"
 STATE_DIR="$HOME/.lich"            # sandboxed Control Center widget writes here
 FLAG="$STATE_DIR/desired-state"    # contents: "on" (risen) or "off" (at rest)
@@ -778,6 +782,9 @@ EOF
     elif ! sudo install -o root -g wheel -m 0440 "$tmp" "$SUDOERS" 2>/dev/null; then
       note_sudoers="could not write $SUDOERS"
     else
+      # Migrate away from the pre-v0.3.2 shared filename, which a second
+      # user's install would have clobbered. Only after the new file exists.
+      sudo rm -f "$SUDOERS_LEGACY" 2>/dev/null
       sudo -k
       if sudo -n "$PMSET" -a disablesleep "$(sleep_disabled)" 2>/dev/null; then
         st_sudoers=ok
@@ -1054,7 +1061,7 @@ cmd_uninstall() {
   rm -rf /Applications/Lich.app 2>/dev/null || true
   pkill -f LichToggle 2>/dev/null || true
   rm -rf /Applications/LichToggle.app 2>/dev/null || true
-  sudo rm -f "$SUDOERS"
+  sudo rm -f "$SUDOERS" "$SUDOERS_LEGACY"
   # The PATH entry — but only if WE made it. On an Intel Mac the Homebrew
   # prefix is also /usr/local, so brew's own symlink (which points into the
   # Cellar) lives at this exact path; that one is brew uninstall's to remove.

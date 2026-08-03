@@ -195,9 +195,13 @@ one-shot, an expired timer, or a roam that hit the floor.
 
 ### What install does
 
-1. Writes `/etc/sudoers.d/lichbook` — passwordless sudo scoped to **exactly
-   two commands**: `pmset -a disablesleep 0` and `pmset -a disablesleep 1`
-   (validated with `visudo -cf` before going live).
+1. Writes `/etc/sudoers.d/lichbook-<you>` — passwordless sudo scoped to
+   **exactly two commands**: `pmset -a disablesleep 0` and
+   `pmset -a disablesleep 1` (validated with `visudo -cf` before going
+   live). Per-user filename, so multiple users' installs never clobber each
+   other's rule. (This must live in root-owned `/etc/sudoers.d/`, not in
+   `~/.lich` — a root grant in a user-writable folder would be a privilege
+   escalation. Everything *else* lich remembers lives per-user in `~/.lich/`.)
 2. Puts `lich` on your PATH by symlinking `/usr/local/bin/lich` — skipped when
    `lich` is already on PATH, as it is after `brew install`.
 3. Creates `~/.lich/desired-state` (starts at rest).
