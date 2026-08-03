@@ -153,7 +153,7 @@ One bash script (`lich`, a few hundred lines, half of them comments — read it
 before you grant it sudo) plus one per-user LaunchAgent,
 `com.lichbook.watcher`:
 
-- The agent runs `lich watch`, which every 5 seconds reads the risen flag and
+- The watcher runs `lich watch`, which every 5 seconds reads the risen flag and
   the power source and flips the hidden `pmset disablesleep` setting: `1` when
   risen **and** (on AC power **or** roaming), `0` otherwise. The same tick
   reads the battery percentage, so an expired timer, a spent one-shot, or a
@@ -193,7 +193,7 @@ one-shot, an expired timer, or a roam that hit the floor.
    `lich` is already on PATH, as it is after `brew install`.
 3. Creates `~/.lich/desired-state` (starts at rest).
 4. Writes and loads `~/Library/LaunchAgents/com.lichbook.watcher.plist`. On a
-   Homebrew install the agent points at brew's stable `opt` path, not the
+   Homebrew install the watcher points at brew's stable `opt` path, not the
    versioned Cellar path, so upgrades don't break it.
 
 `lich uninstall` removes all of it and restores normal sleep (only the log at

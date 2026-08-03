@@ -43,7 +43,7 @@ class Lichbook < Formula
 
         1. lich install    # one-time; ONE sudo prompt. Adds a sudoers rule
                            # scoped to exactly two pmset commands, plus a
-                           # per-user watcher agent.
+                           # per-user watcher process.
         2. lich on         # 💀 risen: lid-close no longer sleeps this Mac
                            # while it's plugged in and you're logged in
 

@@ -761,7 +761,7 @@ EOF
   # 4b. Load it — but ONLY with a proven sudoers rule. Without one the watcher
   #     exits EX_CONFIG on its first tick and KeepAlive respawns it forever:
   #     an ERROR line in the log every ~10s until someone notices. Skipping is
-  #     kinder than that loop. Liveness is measured by polling the agent, not
+  #     kinder than that loop. Liveness is measured by polling the watcher, not
   #     by trusting launchctl's exit status, which lies here.
   if [[ "$st_sudoers" != ok ]]; then
     st_agent=skipped note_agent="not loaded — sudoers rule not working"
@@ -778,8 +778,8 @@ EOF
     if watcher_running; then
       st_agent=ok
     else
-      note_agent="agent did not come up — see $LOG_FILE"
-      echo "lich: warning: agent: $note_agent" >&2
+      note_agent="watcher did not come up — see $LOG_FILE"
+      echo "lich: warning: watcher: $note_agent" >&2
     fi
   fi
 
@@ -800,7 +800,7 @@ EOF
   printf '  %-8s PATH link%s\n'     "$st_link"    "${note_link:+ — $note_link}"
   printf '  %-8s state flag%s\n'    "$st_flag"    "${note_flag:+ — $note_flag}"
   printf '  %-8s watcher plist%s\n' "$st_plist"   "${note_plist:+ — $note_plist}"
-  printf '  %-8s watcher agent%s\n' "$st_agent"   "${note_agent:+ — $note_agent}"
+  printf '  %-8s watcher%s\n'       "$st_agent"   "${note_agent:+ — $note_agent}"
   printf '  %-8s menu bar app%s\n'  "$st_app"     "${note_app:+ — $note_app}"
   echo
   if [[ "$st_sudoers" == ok && "$st_agent" == ok ]]; then
@@ -811,7 +811,7 @@ EOF
     echo "restore sleep, logout will NOT restore sleep, roam timers and the"
     echo "battery floor do NOT run. For real protection keep 'lich watch'"
     echo "running in a terminal or tmux, and re-run 'lich install' after"
-    echo "fixing the agent (start with $LOG_FILE)."
+    echo "fixing the watcher (start with $LOG_FILE)."
   else
     echo "Not functional yet: nothing can change the sleep setting, so"
     echo "lid-close still sleeps normally. 'lich status' and the flag files"
@@ -821,7 +821,7 @@ EOF
   fi
   echo "(The Control Center toggle is a separate, optional source build — see README.)"
 
-  log "cmd: install (sudoers=$st_sudoers link=$st_link flag=$st_flag plist=$st_plist agent=$st_agent app=$st_app)"
+  log "cmd: install (sudoers=$st_sudoers link=$st_link flag=$st_flag plist=$st_plist watcher=$st_agent app=$st_app)"
   set -e
   [[ "$st_sudoers" == ok ]]
 }
