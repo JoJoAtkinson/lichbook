@@ -51,12 +51,14 @@ func lich(_ args: [String]) -> (status: Int32, output: String) {
 // Roaming — staying risen without the phylactery (i.e. on battery). The CLI
 // owns the whole feature, including the battery floor that overrules every
 // mode; this app only arms and disarms it. `lich roam status` prints exactly
-// one machine-readable line, which is the only shape parsed here.
-enum RoamMode: Equatable {
-    case off
-    case once
-    case always
-    case until(Int)   // epoch seconds
+// one machine-readable line of two tokens — "<standing> <trip>" where
+// standing is off|always|timer and trip is -|once|until:<epoch> — and that
+// is the only shape parsed here. Standing = the owner's persistent setting;
+// trip = a temporary overlay that evaporates without touching the setting.
+struct RoamState: Equatable {
+    enum Standing: String { case off, always, timer }
+    var standing: Standing = .off
+    var hasTrip: Bool = false
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -67,25 +69,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // when at rest — the CLI's machine-readable contract for exactly this.
     var risen: Bool { lich(["status", "--quiet"]).status == 0 }
 
-    // Read live, never cached: the CLI clears roam on its own (floor breach,
-    // timer expiry, one-shot spent), so a remembered value would show stale
+    // Read live, never cached: the CLI clears trips on its own (floor breach,
+    // expiry, one-shot spent), so a remembered value would show stale
     // checkmarks. Anything unexpected — a parse miss, or a `lich` too old to
-    // know the command — reads as .off, which degrades the menu to the
-    // pre-roam behaviour instead of claiming a mode that isn't armed.
-    var roamMode: RoamMode {
+    // speak the two-token contract — reads as off/no-trip, which degrades the
+    // menu gracefully instead of claiming a state that isn't armed.
+    var roamState: RoamState {
         let result = lich(["roam", "status"])
-        guard result.status == 0 else { return .off }
+        guard result.status == 0 else { return RoamState() }
         let fields = result.output
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .split(separator: " ")
-        switch fields.first.map(String.init) ?? "" {
-        case "once": return .once
-        case "always": return .always
-        case "until":
-            guard fields.count > 1, let epoch = Int(fields[1]) else { return .off }
-            return .until(epoch)
-        default: return .off
+        var state = RoamState()
+        if let s = fields.first.flatMap({ RoamState.Standing(rawValue: String($0)) }) {
+            state.standing = s
         }
+        if fields.count > 1, fields[1] != "-" { state.hasTrip = true }
+        return state
     }
 
     // The timer item's label has to name the real number of minutes, so read
@@ -168,13 +168,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
 
-    // The three roam items are checkboxes, so each one is its own off switch:
-    // clicking an armed mode disarms it. Arming never has to clear the other
-    // two by hand — roam is a single value in the CLI, so writing one mode
-    // replaces whatever was there. Arming also raises the lich (the CLI does
-    // that too), hence the refresh for the icon.
+    // The roam items are checkboxes, each its own off switch. The trip
+    // ("once") is cleared with `lich done` — which spares the standing
+    // setting by contract — while the two standing modes are cleared with
+    // `roam off`. Arming also raises the lich (the CLI does that), hence the
+    // refresh for the icon.
     @objc func roamOnce(_ sender: NSMenuItem) {
-        armRoam(sender.state == .on ? ["roam", "off"] : ["roam"])
+        armRoam(sender.state == .on ? ["done"] : ["roam"])
     }
 
     @objc func roamAlways(_ sender: NSMenuItem) {
@@ -214,13 +214,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // other mid-menu. Durations are deliberately not editable here: the
         // minutes live in `lich config`, and this menu just reflects them.
         menu.addItem(.separator())
-        let mode = roamMode
-        var isTimed = false
-        if case .until = mode { isTimed = true }
+        let roam = roamState
         let roamItems: [(String, Selector, Bool)] = [
-            ("Stay awake unplugged — once", #selector(roamOnce(_:)), mode == .once),
-            ("Stay awake unplugged — always", #selector(roamAlways(_:)), mode == .always),
-            ("Stay awake unplugged — for \(roamMins) min", #selector(roamTimer(_:)), isTimed),
+            ("Stay awake unplugged — this once", #selector(roamOnce(_:)), roam.hasTrip),
+            ("Stay awake unplugged — always", #selector(roamAlways(_:)), roam.standing == .always),
+            ("Stay awake unplugged — \(roamMins) min each time", #selector(roamTimer(_:)), roam.standing == .timer),
         ]
         for (title, action, checked) in roamItems {
             let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")

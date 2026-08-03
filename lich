@@ -68,11 +68,15 @@ DEFAULT_ROAM_MINS=30    # minutes, for `lich roam timer`
 # Watcher memory — meaningful only inside the `watch` loop, where the process
 # lives for the whole session. Deliberately not persisted: a watcher restart
 # forgetting these is acceptable (worst case, an armed one-shot survives one
-# extra plug-in, and a suspension is logged twice).
-ROAM_GRANTED_ON_BATTERY=0   # a "once" roam actually held the Mac awake off AC
-FLOOR_SUSPEND_LOGGED=0      # always-mode floor suspension: log once, not 12/min
+# extra plug-in, a suspension is logged twice, or a standing-timer window
+# restarts from the watcher's start rather than the unplug — every failure
+# leans toward awake, never toward data loss).
+ROAM_GRANTED_ON_BATTERY=0   # a "once" trip actually held the Mac awake off AC
+FLOOR_SUSPEND_LOGGED=0      # standing-mode floor suspension: log once, not 12/min
 BATTERY_UNREADABLE_LOGGED=0 # ditto for an unparsable battery reading
 BATTERY_PCT=100             # last reading; set by read_battery, never read raw
+ROAM_SESSION_DEADLINE=""    # standing-timer: this battery session's cutoff epoch
+TIMER_ENDED_LOGGED=0        # standing-timer window end: log once per session
 
 # Every log line goes to $LOG_FILE directly, no matter who called — watcher,
 # CLI, menu bar app (which discards CLI output), Control-Center-triggered
@@ -168,138 +172,189 @@ config_set() {
 
 # ---------- roaming --------------------------------------------------------
 # Roaming is staying risen without the phylactery: awake on battery, because
-# you said so, until the trip ends or the floor calls the loan. One file, one
-# value — arming a mode replaces whatever was there, so the three modes are
-# mutually exclusive for free.
+# you said so. Two layers, deliberately:
+#
+#   STANDING mode — the owner's preference, which persists until the owner
+#   changes it: `off` (unplugged means sleep), `always` (unplugged never
+#   means sleep), or `timer` (every unplug gets roam_mins of grace, then
+#   sleep — and the NEXT unplug gets a fresh window; the setting stays).
+#
+#   TRIP — a temporary overlay: `once` (until the cord returns) or
+#   `until <epoch>` (a bounded window, e.g. `lich roam 45`). A trip rides on
+#   top of the standing mode and, when spent or expired, evaporates —
+#   revealing the standing mode again, NOT wiping it to off. Predictability
+#   is the point: using the machine "just this once" never costs you the
+#   default you configured.
+#
+# File grammar (~/.lich/roam, one line): "<standing>[ <trip>]", e.g. "timer",
+# "off once", "timer until 1785768543". Legacy single-value files from
+# v0.2.x ("once", "until N") read as a trip atop standing off.
 
-# Raw contents, first line only. Missing file = off, which is the state a Mac
-# that has never heard of roaming should be in.
-roam_mode() {
-  local m
-  m="$(head -1 "$ROAM" 2>/dev/null || true)"
-  m="${m#"${m%%[![:space:]]*}"}"   # trim leading whitespace
-  m="${m%"${m##*[![:space:]]}"}"   # trim trailing whitespace
-  [[ -n "$m" ]] || m="off"
-  echo "$m"
+# Parse the roam file into ROAM_STANDING and ROAM_TRIP. Missing/unrecognized
+# reads as off with no trip — the state a Mac that never heard of roaming
+# should be in.
+roam_read() {
+  local raw
+  raw="$(head -1 "$ROAM" 2>/dev/null || true)"
+  raw="${raw#"${raw%%[![:space:]]*}"}"   # trim leading whitespace
+  raw="${raw%"${raw##*[![:space:]]}"}"   # trim trailing whitespace
+  ROAM_STANDING=off ROAM_TRIP=""
+  case "$raw" in
+    "") ;;
+    once)             ROAM_TRIP="once" ;;
+    'until '*)        ROAM_TRIP="$raw" ;;
+    off|always|timer) ROAM_STANDING="$raw" ;;
+    'off once'|'always once'|'timer once')
+      ROAM_STANDING="${raw%% *}" ROAM_TRIP="once" ;;
+    'off until '*|'always until '*|'timer until '*)
+      ROAM_STANDING="${raw%% *}" ROAM_TRIP="${raw#* }" ;;
+    *) ;;
+  esac
 }
 
 # Write-then-rename, so a tick that reads this file in the same instant sees
 # the old value or the new one and never an empty file — an empty read means
 # "off", which on battery with the lid shut would sleep the Mac mid-roam.
-roam_set() {
-  local tmp
+# $1 = standing, $2 = trip ("" for none).
+roam_write() {
+  local line="$1" tmp
+  [[ -n "${2:-}" ]] && line="$1 $2"
   mkdir -p "$STATE_DIR"
   tmp="$STATE_DIR/.roam.$$"
-  printf '%s\n' "$1" > "$tmp"
+  printf '%s\n' "$line" > "$tmp"
   mv "$tmp" "$ROAM"
 }
 
-# The mode as a reader should see it: same four values as the file, except an
-# elapsed timer and anything unrecognized report "off". Pure — no writes, no
-# log lines — because `lich roam status` is parsed by the menu bar app and
-# `lich status` must stay read-only. Clearing an expired timer is the
-# watcher's job, and only the watcher's, so the log gets exactly one line
-# about it.
+# The machine-readable state, EXACTLY two tokens on one line:
+#   "<standing> <trip>"  where standing ∈ off|always|timer and trip ∈
+#   "-" (none) | "once" | "until:<epoch>".
+# The menu bar app parses this — no decoration, no extra lines. Pure — no
+# writes, no log lines — an elapsed trip reports as "-"; clearing it is the
+# watcher's job, and only the watcher's, so the log gets exactly one line.
 roam_state() {
-  local mode epoch
-  mode="$(roam_mode)"
-  case "$mode" in
-    once|always) echo "$mode" ;;
+  local trip="-" epoch
+  roam_read
+  case "$ROAM_TRIP" in
+    once) trip="once" ;;
     'until '*)
-      epoch="${mode#until }"
+      epoch="${ROAM_TRIP#until }"
       if [[ "$epoch" =~ ^[0-9]+$ ]] && [[ "$(date +%s)" -lt "$epoch" ]]; then
-        echo "until $epoch"
-      else
-        echo off
+        trip="until:$epoch"
       fi
       ;;
-    *) echo off ;;
   esac
+  echo "$ROAM_STANDING $trip"
 }
 
-# Roaming in English, for `lich status`. Same pure read as roam_state.
+# Roaming in English, for `lich status`.
 roam_human() {
-  local state epoch left
+  local state standing trip epoch left mins standing_desc
   state="$(roam_state)"
-  case "$state" in
-    once)   echo "once — stays risen unplugged, until you plug back in" ;;
-    always) echo "always — stays risen unplugged" ;;
-    'until '*)
-      epoch="${state#until }"
-      left=$(( ( epoch - $(date +%s) + 59 ) / 60 ))   # round up: 0 min left
-      [[ "$left" -lt 1 ]] && left=1                   # reads as expired
-      echo "$left min left — stays risen unplugged"
-      ;;
-    *) echo "off — unplugged means sleep" ;;
+  standing="${state%% *}"
+  trip="${state#* }"
+  mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
+  case "$standing" in
+    always) standing_desc="always — stays risen unplugged" ;;
+    timer)  standing_desc="timer — ${mins} min of grace at every unplug" ;;
+    *)      standing_desc="off — unplugged means sleep" ;;
+  esac
+  case "$trip" in
+    once)
+      echo "once (this trip, until you plug back in) — then: $standing_desc" ;;
+    until:*)
+      epoch="${trip#until:}"
+      left=$(( ( epoch - $(date +%s) + 59 ) / 60 ))
+      [[ "$left" -lt 1 ]] && left=1
+      echo "$left min left (this trip) — then: $standing_desc" ;;
+    *)
+      echo "$standing_desc" ;;
   esac
 }
 
 # The watcher's question, asked only on battery (on AC the answer doesn't
 # matter — the phylactery already keeps the lich up). Unlike everything above
-# this one is allowed to write: expiry, floor breach and their log lines are
-# state changes the watcher owns.
+# this one is allowed to write: trip expiry, floor breach and their log lines
+# are state changes the watcher owns. Standing modes are NEVER written here —
+# only the owner (roam off / roam always / roam timer) changes those.
 roam_active() {
-  local mode floor epoch
-  mode="$(roam_mode)"
-  [[ "$mode" == "off" ]] && return 1
+  local floor epoch now mins
+  roam_read
+  [[ "$ROAM_STANDING" == off && -z "$ROAM_TRIP" ]] && return 1
 
-  # The floor outranks every mode, always-mode included. A once/timed roam
-  # that hits it is spent — cleared, so nothing silently resumes at 19%. An
-  # always-mode roam is only suspended: it is a standing preference, not a
-  # trip, and it must survive to the next charge.
+  # The floor outranks everything. A trip that hits it is spent — cleared, so
+  # nothing silently resumes at 19%. A standing mode is only suspended: it is
+  # the owner's preference, and it must survive to the next charge.
   floor="$(config_get floor "$DEFAULT_FLOOR")"
   read_battery
   if [[ "$BATTERY_PCT" -le "$floor" ]]; then
-    case "$mode" in
-      always)
-        if [[ "$FLOOR_SUSPEND_LOGGED" == 0 ]]; then
-          log "battery floor ${floor}% — roam suspended (always-mode kept)"
-          FLOOR_SUSPEND_LOGGED=1
-        fi
-        ;;
-      *)
-        roam_set off
-        log "battery floor ${floor}% — roam canceled"
-        ;;
-    esac
+    if [[ -n "$ROAM_TRIP" ]]; then
+      roam_write "$ROAM_STANDING" ""
+      log "battery floor ${floor}% — trip roam canceled"
+    fi
+    if [[ "$ROAM_STANDING" != off && "$FLOOR_SUSPEND_LOGGED" == 0 ]]; then
+      log "battery floor ${floor}% — standing roam ($ROAM_STANDING) suspended until recharge"
+      FLOOR_SUSPEND_LOGGED=1
+    fi
     return 1
   fi
 
-  case "$mode" in
+  # Trip overlay first — it exists to outlast/override the standing answer.
+  case "$ROAM_TRIP" in
     once)
       # Remember that the grant did real work, so the return of the
       # phylactery can spend it. In-memory on purpose (see the top of file).
       ROAM_GRANTED_ON_BATTERY=1
       return 0
       ;;
-    always) return 0 ;;
     'until '*)
-      epoch="${mode#until }"
+      epoch="${ROAM_TRIP#until }"
       if [[ "$epoch" =~ ^[0-9]+$ ]] && [[ "$(date +%s)" -lt "$epoch" ]]; then
         return 0
       fi
-      roam_set off
-      log "roam timer expired"
+      roam_write "$ROAM_STANDING" ""
+      log "trip roam expired — back to standing setting: $ROAM_STANDING"
+      ;;
+  esac
+
+  # Then the standing mode.
+  case "$ROAM_STANDING" in
+    always) return 0 ;;
+    timer)
+      now="$(date +%s)"
+      if [[ -z "$ROAM_SESSION_DEADLINE" ]]; then
+        # First battery tick of this session: the grace window starts now.
+        # (After a watcher restart mid-session it restarts from here — a
+        # fresh window, failing toward awake; documented tradeoff.)
+        mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
+        ROAM_SESSION_DEADLINE=$(( now + mins * 60 ))
+        log "unplugged with standing timer — ${mins} min grace window begins"
+      fi
+      if [[ "$now" -lt "$ROAM_SESSION_DEADLINE" ]]; then
+        return 0
+      fi
+      if [[ "$TIMER_ENDED_LOGGED" == 0 ]]; then
+        log "standing timer window ended — sleeping until the next unplug (setting kept)"
+        TIMER_ENDED_LOGGED=1
+      fi
       return 1
       ;;
-    *)
-      # Unrecognized contents. Treat as off — same posture as the risen flag,
-      # where only the exact expected string counts.
-      return 1
-      ;;
+    *) return 1 ;;
   esac
 }
 
 # What the tick has to do about roaming when the cord is back: spend a
-# one-shot that was actually used, and re-arm the once-per-session suspension
-# notice. Only ever called with AC present.
+# one-shot trip that actually did work, and reset the per-battery-session
+# memory (floor-suspension notice, timer window). Only called with AC present.
 roam_on_ac() {
-  if [[ "$ROAM_GRANTED_ON_BATTERY" == 1 && "$(roam_mode)" == "once" ]]; then
-    roam_set off
-    log "phylactery restored — one-shot roam spent"
+  roam_read
+  if [[ "$ROAM_GRANTED_ON_BATTERY" == 1 && "$ROAM_TRIP" == "once" ]]; then
+    roam_write "$ROAM_STANDING" ""
+    log "phylactery restored — one-shot roam spent (standing setting kept: $ROAM_STANDING)"
   fi
   ROAM_GRANTED_ON_BATTERY=0
   FLOOR_SUSPEND_LOGGED=0
+  ROAM_SESSION_DEADLINE=""
+  TIMER_ENDED_LOGGED=0
 }
 
 # ---------- more state probes ----------------------------------------------
@@ -344,7 +399,7 @@ reconcile() {
     want=1
   fi
   [[ "$(sleep_disabled)" == "$want" ]] && return 0
-  roam="$(roam_state)"
+  roam="$(roam_state | tr ' ' '/')"   # e.g. off/-, timer/once — one log token
   if sudo -n "$PMSET" -a disablesleep "$want" 2>/dev/null; then
     log "risen=$(risen && echo yes || echo no) power=$(power_source) roam=$roam -> disablesleep=$want"
   else
@@ -472,7 +527,8 @@ cmd_roam() {
       return 0
       ;;
     off)
-      roam_set off
+      # The one command that clears the STANDING preference (and any trip).
+      roam_write off ""
       log "cmd: roam off"
       echo "roam off — unplugging lays the lich to rest again"
       return 0
@@ -482,34 +538,45 @@ cmd_roam() {
   floor="$(config_get floor "$DEFAULT_FLOOR")"
   case "$arg" in
     ""|once)
-      roam_set once
+      # A trip atop the standing mode — spending it never costs the default.
+      roam_read
+      roam_write "$ROAM_STANDING" "once"
       raise
-      log "cmd: roam once"
+      log "cmd: roam once (standing kept: $ROAM_STANDING)"
       echo "💀 roaming once — risen without the phylactery until you plug back in (floor ${floor}%)"
+      [[ "$ROAM_STANDING" != off ]] && echo "   (your standing setting — $ROAM_STANDING — is kept and returns after this trip)"
       ;;
     always)
-      roam_set always
+      # Standing preference: replaces any previous standing mode; a pending
+      # trip is subsumed (always outranks it anyway).
+      roam_write always ""
       raise
-      log "cmd: roam always"
+      log "cmd: roam always (standing)"
       echo "💀 roaming always — unplugging no longer rests the lich (floor ${floor}% still does)"
       ;;
     timer)
+      # Standing preference: EVERY unplug gets a fresh grace window; the
+      # setting persists until `lich roam off`.
       mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
-      cmd_roam "$mins"
-      return 0
+      roam_write timer ""
+      raise
+      log "cmd: roam timer (standing, ${mins}m per unplug)"
+      echo "💀 roaming on a timer — every unplug gets ${mins} min of grace, then sleep (floor ${floor}%; setting persists)"
       ;;
     *)
-      # `lich roam 45` and `lich roam 45m` are the same request.
+      # `lich roam 45` / `45m`: a bounded trip — this window only, standing kept.
       if [[ "$arg" =~ ^([0-9]+)m?$ ]]; then
         mins="${BASH_REMATCH[1]}"
         [[ "$mins" -ge 1 ]] || die "roam: minutes must be 1 or more"
         epoch=$(( $(date +%s) + mins * 60 ))
-        roam_set "until $epoch"
+        roam_read
+        roam_write "$ROAM_STANDING" "until $epoch"
         raise
-        log "cmd: roam ${mins}m (until $epoch)"
+        log "cmd: roam ${mins}m trip (until $epoch, standing kept: $ROAM_STANDING)"
         echo "💀 roaming for ${mins} min — risen without the phylactery until $(date -r "$epoch" '+%H:%M') (floor ${floor}%)"
+        [[ "$ROAM_STANDING" != off ]] && echo "   (your standing setting — $ROAM_STANDING — is kept and returns after this trip)"
       else
-        die "unknown roam mode: $arg (try: lich roam, roam always, roam <minutes>, roam timer, roam off, roam status)"
+        die "unknown roam mode: $arg (try: lich roam, roam always, roam timer, roam <minutes>, roam off, roam status)"
       fi
       ;;
   esac
@@ -520,19 +587,20 @@ cmd_roam() {
 # given; it does not spend the owner's standing preference, and it never lays
 # the lich to rest — `lich off` is a human decision about a human's Mac.
 cmd_done() {
-  case "$(roam_mode)" in
-    once|'until '*)
-      roam_set off
-      log "cmd: done (roam cleared)"
-      echo "roam cleared — this Mac may sleep again once unplugged (still risen; 'lich off' to rest)"
-      ;;
-    always)
-      echo "roam is 'always' — left as is; clear it yourself with: lich roam off"
-      ;;
-    *)
-      echo "roam already off — nothing to clear"
-      ;;
-  esac
+  roam_read
+  if [[ -n "$ROAM_TRIP" ]]; then
+    roam_write "$ROAM_STANDING" ""
+    log "cmd: done (trip cleared, standing kept: $ROAM_STANDING)"
+    if [[ "$ROAM_STANDING" == off ]]; then
+      echo "trip cleared — this Mac may sleep again once unplugged (still risen; 'lich off' to rest)"
+    else
+      echo "trip cleared — back to the owner's standing setting: $ROAM_STANDING"
+    fi
+  elif [[ "$ROAM_STANDING" != off ]]; then
+    echo "no trip to clear — '$ROAM_STANDING' is the owner's standing setting, not yours to spend (lich roam off, if you're the owner)"
+  else
+    echo "roam already off — nothing to clear"
+  fi
 }
 
 # ---------- config ----------------------------------------------------------
@@ -984,10 +1052,13 @@ usage: lich [command]     (bare `lich` = status)
              -q, --quiet  print nothing; exit 0 if risen, non-zero if at rest
   log [n]    last n log lines (default 25) — every state change from every
              front end, timestamped; the evidence trail
-  roam       stay risen unplugged for one trip, and raise if at rest
-             roam always   every unplug, until you turn it off
-             roam <N>      for N minutes (45 or 45m); also: roam timer,
-                           which uses the configured roam_mins
+  roam       trip: stay risen unplugged until you next plug in — your
+             standing setting below is kept and returns afterward
+             roam <N>      trip, bounded: N minutes (45 or 45m)
+             roam always   STANDING: unplugged never means sleep
+             roam timer    STANDING: every unplug gets roam_mins of grace,
+                           then sleep — persists until roam off
+             roam off      clear the standing setting (and any trip)
              roam off      stop roaming (leaves the risen flag alone)
              roam status   one bare line: off | once | always | until <epoch>
   done       for agents: clear a once/timed roam now the work is finished.

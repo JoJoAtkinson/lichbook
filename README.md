@@ -59,24 +59,33 @@ couch, a build you'd rather not babysit next to an outlet. **Roaming is the
 lich risen without its phylactery**: awake on battery, deliberately, with a
 floor that ends it before your battery pays for it.
 
+Roaming has two layers, so a one-off never costs you your default:
+
+- **Standing settings** persist until you change them: `always` (unplugged
+  never means sleep) or `timer` (**every** unplug gets `roam_mins` of grace —
+  30 min out of the box — then sleep; the next unplug gets a fresh window).
+- **Trips** are temporary overlays: `roam` (until you next plug in) or
+  `roam 45` (a bounded window). When a trip is spent or expires, it
+  evaporates — and your standing setting is simply back, untouched.
+
 ```sh
-lich roam           # once — stay awake unplugged, until you plug back in
-lich roam always    # every time you unplug, from now on
-lich roam 45        # for 45 minutes (45m works too)
-lich roam timer     # for the configured default (roam_mins, 30 min out of the box)
-lich roam off       # stop roaming — unplugged means sleep again
-lich roam status    # one machine-readable line: off | once | always | until <epoch>
+lich roam           # TRIP: stay awake unplugged until you plug back in
+lich roam 45        # TRIP: for 45 minutes (45m works too)
+lich roam always    # STANDING: every unplug, from now on
+lich roam timer     # STANDING: roam_mins of grace at every unplug, forever
+lich roam off       # clear the standing setting (and any trip)
+lich roam status    # machine-readable: "<standing> <trip>", e.g. "timer -",
+                    # "off once", "timer until:<epoch>"
 ```
 
-Every form except `off` and `status` also raises the lich, so one command is
-enough from a cold start. Roaming is a single setting, not three: arming one
-mode replaces whatever was there before.
+Every arming form also raises the lich, so one command is enough from a cold
+start.
 
-| Mode | Lasts until | Good for |
-|------|-------------|----------|
-| `once` | the next time you plug back in | one trip away from the desk |
-| `always` | you run `lich roam off` | "unplugged should never mean asleep" |
-| `<N>` / `timer` | the timer expires | a job you know the length of |
+| You run | Lasts | Your standing setting |
+|---------|-------|----------------------|
+| `roam` / `roam 45` | this trip / this window | **kept** — returns when the trip ends |
+| `roam always` | until `roam off` | *is* the setting |
+| `roam timer` | 30 min per unplug, every unplug | *is* the setting |
 
 `lich roam status` is what the menu bar app parses — one bare line, no
 decoration. `lich status` says the same thing in English, plus the battery
@@ -119,10 +128,10 @@ to keep this Mac awake, hand the machine back when you're done:
 lich done
 ```
 
-That clears a `once` or timed roam so an unplugged Mac is free to sleep
-again. It deliberately does **not** touch `always` (that's the owner's
-standing preference, not yours to spend) and does **not** lay the lich to
-rest — `lich off` stays a human decision.
+That clears a **trip** (a `once` or bounded roam) so an unplugged Mac is
+free to sleep again. It deliberately does **not** touch the standing setting
+(`always` or `timer` — the owner's preference, not yours to spend) and does
+**not** lay the lich to rest — `lich off` stays a human decision.
 
 ---
 
@@ -217,17 +226,19 @@ battery floor and timer minutes stay in `lich config`; the menu just
 reflects them. It shells out to the `lich` CLI, so the CLI stays the single
 source of truth.
 
-The roaming checkboxes are the three modes, in plain English:
+The roaming checkboxes, in plain English:
 
-- **Stay awake unplugged — once**
-- **Stay awake unplugged — always**
-- **Stay awake unplugged — for N min** — N is your configured `roam_mins`,
-  read live, so the label shows the real number
+- **Stay awake unplugged — this once** — a trip; unticking it (or plugging
+  back in) returns you to your standing setting below
+- **Stay awake unplugged — always** — standing setting
+- **Stay awake unplugged — N min each time** — standing setting: every
+  unplug gets N minutes of grace (N is your configured `roam_mins`, read
+  live, so the label shows the real number)
 
-Ticking one arms that mode and clears the other two; ticking the checked one
-turns roaming off. Durations are set with `lich config roam_mins` and nowhere
-else — the menu stays a switch, not a settings panel. The battery floor
-applies here exactly as it does from the CLI.
+The two standing settings are mutually exclusive; the trip rides on top of
+either. Durations are set with `lich config roam_mins` and nowhere else —
+the menu stays a switch, not a settings panel. The battery floor applies
+here exactly as it does from the CLI.
 
 It registers itself as a login item on first launch (SMAppService); uncheck
 "Start at Login" in its menu if you'd rather it didn't.

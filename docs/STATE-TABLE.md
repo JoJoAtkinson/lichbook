@@ -556,7 +556,17 @@ measured read-only on the maintainer's Mac (26.5.2 / 25F84, 2026-08-02).
 
 ---
 
-## 14. Roaming (added in v0.2.0)
+## 14. Roaming (added in v0.2.0; **semantics revised in v0.3.0**)
+
+> **v0.3.0 change:** roam became two layers — a persistent **standing**
+> setting (`off`/`always`/`timer`, where `timer` grants a fresh
+> `roam_mins` window at *every* unplug) plus a temporary **trip** overlay
+> (`once` / bounded minutes) that evaporates without touching the standing
+> setting. The rows below were tested against v0.2.x single-value semantics;
+> their *mechanics* (floor, expiry precision, spend-on-AC) carry over to
+> trips unchanged, but "cleared to off" now means "trip cleared, standing
+> revealed". Standing-timer per-unplug renewal is new in v0.3.0 and
+> **Untested** until it happens in the field.
 
 Battery keep-awake ("roam") rows, authored by the review gate after the
 feature landed. The AC-side paths were exercised live; the battery-side logic
