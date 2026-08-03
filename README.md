@@ -10,9 +10,10 @@ it has a battery floor.)
 
 ```sh
 brew tap jojoatkinson/lichbook https://github.com/JoJoAtkinson/lichbook
-brew install lichbook   # if brew asks: brew trust jojoatkinson/lichbook
-lich install            # one-time privileged setup; sudo prompts once
-lich on                 # 💀 risen
+brew trust jojoatkinson/lichbook   # third-party taps need explicit trust
+brew install lichbook              # builds the menu bar app on your machine
+lich install                       # one-time privileged setup; sudo prompts once
+lich on                            # 💀 risen
 ```
 
 That's it. Close the lid on a docked Mac and Claude Code sessions, `claude
