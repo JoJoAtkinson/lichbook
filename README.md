@@ -317,7 +317,7 @@ code verifiably does about it, and what is merely promised — lives in
 
 ## Credits
 
-Mechanism and hygiene borrowed from
+All code here is original; these projects inspired the approach —
 [tmad4000/nosleep](https://github.com/tmad4000/nosleep) (scoped sudoers,
 cleanup traps), [Moarram/wake](https://github.com/Moarram/wake) (minimal
 `pmset` wrapping), and
