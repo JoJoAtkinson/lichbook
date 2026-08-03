@@ -766,6 +766,12 @@ cmd_install() {
   sudo -k 2>/dev/null
   if sudo -n "$PMSET" -a disablesleep "$(sleep_disabled)" 2>/dev/null; then
     st_sudoers=ok note_sudoers="already in place (no prompt needed)"
+    # A working rule short-circuits the write below — which also means the
+    # v0.3.2 filename migration never fires for a working legacy install.
+    # Can't fix it passwordlessly (the rule grants pmset, not rm), so say so.
+    if [[ -f "$SUDOERS_LEGACY" ]]; then
+      note_sudoers="working, but via the legacy shared file — to adopt the per-user filename: sudo rm $SUDOERS_LEGACY && lich install"
+    fi
   else
     # One credential prompt, up front. Declined, or a non-admin user =
     # the privileged steps below are skipped in one go.
