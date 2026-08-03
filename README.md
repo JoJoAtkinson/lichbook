@@ -1,5 +1,10 @@
 # lichbook 💀
 
+[![Release](https://img.shields.io/github/v/release/JoJoAtkinson/lichbook?color=6e40c9)](https://github.com/JoJoAtkinson/lichbook/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B%20Tahoe-black)
+![Install](https://img.shields.io/badge/install-homebrew-orange)
+
 **Close your lid. Your prompts, agents, and remote sessions keep running.**
 Only while it's plugged in and you're logged in — unplug it, log out, or lay
 it to rest, and it sleeps like any mortal machine. (Need it awake off the
