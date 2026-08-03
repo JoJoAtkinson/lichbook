@@ -566,7 +566,8 @@ is code-verified but **not yet field-tested on battery** — statuses say so.
 |---|---|---|---|
 | Risen, on battery, `once` armed, above floor | Awake, lid open or closed (lid-close still locks); next return to AC spends the one-shot, logged | Yes — `roam_active` / `roam_on_ac` | Should-work |
 | Risen, on battery, `always`, above floor | Awake indefinitely while above the floor | Yes | Should-work |
-| Timed roam expires on battery | Sleeps within ~5s; roam cleared to `off`, logged once (watcher is the only writer of expiry) | Yes | Should-work |
+| Timed roam expires on battery | Sleeps within ~5s; roam cleared to `off`, logged once (watcher is the only writer of expiry) | Yes | **Tested** 2026-08-03: 30-min roam armed 10:19:03, lid closed, no power; heartbeat = 29/29 consecutive minute-beats (fully available all window); `roam timer expired` + release at 10:49:05 (**+2s** past deadline); asleep before the next minute-beat; battery 100% → 100% |
+| Risen + roam active on battery, lid closes | Held awake by the roam grant; the lid-close lock fires exactly as on AC | Yes — lock path gated on `sleep_disabled == 1`, which roam satisfies | **Tested** 2026-08-03: lock requested 10:22:21 while roaming on battery (verification failed — Tahoe intermittence, tally 3 fail / 1 success; availability unaffected) |
 | `once`/timed roam hits the floor (default 20%) | Canceled outright; sleeps within ~5s; nothing silently resumes at 19% | Yes | Should-work |
 | `always` roam hits the floor | **Suspended, not cleared** — sleeps below floor, standing preference survives to the next charge | Yes | Should-work |
 | Roam armed but watcher dead | Nothing enforces the floor or timer — the flags are inert, and a stale `disablesleep 1` stays | No — the watcher *is* the enforcement | Known-gap |
