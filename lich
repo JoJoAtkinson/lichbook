@@ -750,7 +750,7 @@ cmd_install() {
 
   # Say it out loud first, in the order it happens. Anyone about to type their
   # password deserves the list.
-  echo "This sets up (one sudo prompt):"
+  echo "This sets up (at most one sudo prompt; none if the rule already works):"
   echo "  1. $SUDOERS — passwordless sudo for EXACTLY two commands:"
   echo "       pmset -a disablesleep 0   and   pmset -a disablesleep 1"
   echo "  2. lich on your PATH (skipped if it already is, e.g. via Homebrew)"
@@ -759,9 +759,18 @@ cmd_install() {
   echo "  5. /Applications/Lich.app (menu bar 💀 — if a built copy is available)"
   echo
 
-  # One credential prompt, up front. Declined or unavailable = the privileged
-  # steps below are skipped in one go instead of re-prompting at each.
-  sudo -v && have_sudo=1
+  # PROBE FIRST: if the passwordless rule already works — a re-install, or a
+  # standard (non-admin) user whose rule an admin granted by hand — there is
+  # nothing to write and nobody to prompt. This is what lets a non-admin
+  # complete install fully once an admin has granted the two-command rule.
+  sudo -k 2>/dev/null
+  if sudo -n "$PMSET" -a disablesleep "$(sleep_disabled)" 2>/dev/null; then
+    st_sudoers=ok note_sudoers="already in place (no prompt needed)"
+  else
+    # One credential prompt, up front. Declined, or a non-admin user =
+    # the privileged steps below are skipped in one go.
+    sudo -v && have_sudo=1
+  fi
 
   # 1. The scoped sudoers rule (the load-bearing step). Validated with
   #    `visudo -cf` BEFORE it goes live — a syntax error in a live sudoers
@@ -770,7 +779,9 @@ cmd_install() {
   #    drops the credential `sudo -v` just cached (without it the probe passes
   #    on a machine with no rule at all); re-applying the current live value
   #    makes the probe a visible no-op.
-  if [[ "$have_sudo" == 1 ]]; then
+  if [[ "$st_sudoers" == ok ]]; then
+    : # probe already proved the rule — nothing to write
+  elif [[ "$have_sudo" == 1 ]]; then
     tmp="$(mktemp)"
     cat > "$tmp" <<EOF
 # lichbook: allow toggling lid-close sleep without a password.
@@ -794,7 +805,7 @@ EOF
     fi
     rm -f "$tmp"
   else
-    st_sudoers=skipped note_sudoers="no sudo credential"
+    st_sudoers=skipped note_sudoers="no sudo rights (non-admin, or prompt declined)"
   fi
   [[ "$st_sudoers" == ok ]] || echo "lich: warning: sudoers: $note_sudoers" >&2
 
@@ -913,9 +924,10 @@ EOF
   else
     echo "Not functional yet: nothing can change the sleep setting, so"
     echo "lid-close still sleeps normally. 'lich status' and the flag files"
-    echo "work; fix the rule and re-run 'lich install', or add it by hand"
+    echo "work. Fix: an ADMIN adds this rule (works for non-admin users too)"
     echo "with 'sudo visudo -f $SUDOERS':"
     echo "  $USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1"
+    echo "— then re-run 'lich install' as $USER: no password will be needed."
   fi
   echo "(The Control Center toggle is a separate, optional source build — see README.)"
 
