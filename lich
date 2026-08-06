@@ -57,6 +57,8 @@ STATE_DIR="$HOME/.lich"            # sandboxed Control Center widget writes here
 FLAG="$STATE_DIR/desired-state"    # contents: "on" (risen) or "off" (at rest)
 ROAM="$STATE_DIR/roam"             # "off" | "once" | "always" | "until <epoch>"
 CONFIG="$STATE_DIR/config"         # key=value lines: floor, roam_mins
+DEADLINE="$STATE_DIR/session-deadline"  # epoch when a live standing-timer
+                                   # window ends — written for DISPLAY only
 PMSET="/usr/bin/pmset"             # absolute: the sudoers rule matches this
                                    # exact string, so every caller must too
 POLL_INTERVAL=5   # seconds between checks; the worst-case delay for a flag
@@ -68,6 +70,11 @@ POLL_INTERVAL=5   # seconds between checks; the worst-case delay for a flag
 # is a worse tool than one that sleeps, so there is no override flag.
 DEFAULT_FLOOR=20        # percent
 DEFAULT_ROAM_MINS=30    # minutes, for `lich roam timer`
+
+# How long the Mac may stay awake after lich hands sleep back to macOS before
+# the watcher goes looking for who is holding it up. Well past any sane
+# display-sleep + idle-sleep timer, so a firing is meaningful, not jitter.
+AWAKE_WARN_MINS=15
 
 # Watcher memory — meaningful only inside the `watch` loop, where the process
 # lives for the whole session. Deliberately not persisted: a watcher restart
@@ -81,6 +88,10 @@ BATTERY_UNREADABLE_LOGGED=0 # ditto for an unparsable battery reading
 BATTERY_PCT=100             # last reading; set by read_battery, never read raw
 ROAM_SESSION_DEADLINE=""    # standing-timer: this battery session's cutoff epoch
 TIMER_ENDED_LOGGED=0        # standing-timer window end: log once per session
+AWAKE_TICKS=0               # consecutive battery ticks with disablesleep=0;
+                            # ticks freeze while the Mac sleeps, so this
+                            # approximates awake time that macOS owns
+AWAKE_WARN_LOGGED=0         # overdue-sleep warning: once per battery session
 
 # Every log line goes to $LOG_FILE directly, no matter who called — watcher,
 # CLI, menu bar app (which discards CLI output), Control-Center-triggered
@@ -238,6 +249,26 @@ roam_write() {
   mv "$tmp" "$ROAM"
 }
 
+# The standing-timer window's end, persisted so status and the menu can show
+# "hands back to macOS at HH:MM" — the answer to "will this sleep if I walk
+# away?", which pure watcher memory couldn't give them. The watcher's
+# in-memory ROAM_SESSION_DEADLINE stays the authority; this file is a
+# signpost, and a stale one is harmless because readers gate on the live
+# state (disablesleep, battery, timer standing) before showing it.
+deadline_write() {
+  local tmp
+  mkdir -p "$STATE_DIR"
+  tmp="$STATE_DIR/.deadline.$$"
+  printf '%s\n' "$1" > "$tmp"
+  mv "$tmp" "$DEADLINE"
+}
+deadline_clear() { rm -f "$DEADLINE" 2>/dev/null || true; }
+deadline_read() {
+  local v
+  v="$(cat "$DEADLINE" 2>/dev/null || true)"
+  [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo ""
+}
+
 # The machine-readable state, EXACTLY two tokens on one line:
 #   "<standing> <trip>"  where standing ∈ off|always|timer and trip ∈
 #   "-" (none) | "once" | "until:<epoch>".
@@ -340,13 +371,14 @@ roam_active() {
         # fresh window, failing toward awake; documented tradeoff.)
         mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
         ROAM_SESSION_DEADLINE=$(( now + mins * 60 ))
+        deadline_write "$ROAM_SESSION_DEADLINE"
         log "unplugged with standing timer — ${mins} min grace window begins"
       fi
       if [[ "$now" -lt "$ROAM_SESSION_DEADLINE" ]]; then
         return 0
       fi
       if [[ "$TIMER_ENDED_LOGGED" == 0 ]]; then
-        log "standing timer window ended — sleeping until the next unplug (setting kept)"
+        log "standing timer window ended — sleep handed back to macOS until the next unplug (setting kept)"
         TIMER_ENDED_LOGGED=1
       fi
       return 1
@@ -367,6 +399,7 @@ roam_on_ac() {
   ROAM_GRANTED_ON_BATTERY=0
   FLOOR_SUSPEND_LOGGED=0
   ROAM_SESSION_DEADLINE=""
+  deadline_clear
   TIMER_ENDED_LOGGED=0
 }
 
@@ -386,6 +419,32 @@ lid_closed() { ioreg -r -k AppleClamshellState -d 1 2>/dev/null | grep -q '"Appl
 
 console_locked() { ioreg -n Root -d1 -a 2>/dev/null | plutil -p - 2>/dev/null | grep -q '"IOConsoleLocked" => true'; }
 
+# Who ELSE is keeping the Mac awake. disablesleep is lich's lever; power
+# assertions are everyone else's — a playing video, a Zoom call, a stray
+# caffeinate — and with the lid open they block idle sleep just as thoroughly.
+# One line per assertion: '<process> — <type> "<name>" (held <h:mm:ss>)'.
+# Two deliberate omissions: powerd's "prevent sleep while display is on" is a
+# consequence of the display being on, not a cause, and would pad every
+# snapshot; UserIsActive is a 2-minute input tickle that would name the user
+# for touching the trackpad.
+sleep_blockers() {
+  "$PMSET" -g assertions 2>/dev/null | sed -nE \
+    's/^[[:space:]]*pid [0-9]+\(([^)]*)\): \[[^]]*\] ([0-9:]+) (NoDisplaySleepAssertion|PreventUserIdleDisplaySleep|PreventUserIdleSystemSleep|PreventSystemSleep|NoIdleSleepAssertion) named: "([^"]*)".*/\1 — \3 "\4" (held \2)/p' \
+    | grep -v 'Powerd - Prevent sleep while display is on' || true
+}
+
+# Write each live blocker to the log under a prefix. Returns 0 if anything was
+# logged, 1 if the coast is clear — the caller owns latching and severity.
+log_blockers() {
+  local prefix="$1" any=1 line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    log "$prefix $line"
+    any=0
+  done < <(sleep_blockers)
+  return "$any"
+}
+
 # Locking = starting the screensaver, which arms the system's own
 # "require password after screensaver/display off" setting. No accessibility
 # or automation permission needed, and it works with the lid already shut.
@@ -404,8 +463,9 @@ lock_console() { open -a ScreenSaverEngine 2>/dev/null || true; }
 # battery. The AC branch does the mirror-image bookkeeping: spending a
 # one-shot the moment the cord comes back.
 reconcile() {
-  local want=0 roam=off
+  local want=0 roam=off ac=0
   if on_ac; then
+    ac=1
     roam_on_ac
     if risen; then want=1; fi
   elif risen && roam_active; then
@@ -415,6 +475,12 @@ reconcile() {
   roam="$(roam_state | tr ' ' '/')"   # e.g. off/-, timer/once — one log token
   if sudo -n "$PMSET" -a disablesleep "$want" 2>/dev/null; then
     log "risen=$(risen && echo yes || echo no) power=$(power_source) roam=$roam -> disablesleep=$want"
+    # Handing sleep back is a promise macOS may not keep: any app assertion
+    # live at this moment blocks the idle sleep we just re-enabled. Name them
+    # now, so a Mac found awake hours later has its culprit on record.
+    if [[ "$want" == 0 && "$ac" == 0 ]]; then
+      log_blockers "  blocker at handoff:" || true
+    fi
   else
     # Refused, and -n means we never hung on a prompt to find out. Don't spin
     # silently: die and let the log say why.
@@ -454,9 +520,30 @@ cmd_watch() {
   # unlock over Screen Sharing with the lid down is never fought.
   LID_WAS_CLOSED=0
   LOCK_PENDING=0
+  local sd saver screenlock
   while :; do
     reconcile || exit $?   # broken sudoers = die loudly; launchd retries
-    if [[ "$(sleep_disabled)" == "1" ]] && lid_closed; then
+    sd="$(sleep_disabled)"
+    # Overdue-sleep watchdog. Once lich lets go on battery, macOS should sleep
+    # the Mac within its own idle timers — minutes. If we are still ticking
+    # AWAKE_WARN_MINS later, something is holding it awake, and the whole
+    # point of this log is to name that something while it is still there.
+    # (Ticks freeze during sleep, so the counter only accumulates real awake
+    # time; an active user counts too, and gets named honestly — once.)
+    if on_ac; then
+      AWAKE_TICKS=0; AWAKE_WARN_LOGGED=0
+    elif [[ "$sd" == "0" ]]; then
+      AWAKE_TICKS=$(( AWAKE_TICKS + 1 ))
+      if [[ "$AWAKE_WARN_LOGGED" == 0 && "$AWAKE_TICKS" -ge $(( AWAKE_WARN_MINS * 60 / POLL_INTERVAL )) ]]; then
+        AWAKE_WARN_LOGGED=1
+        log_warn "WARNING: still awake ${AWAKE_WARN_MINS} min after sleep was handed back to macOS — naming who holds it:"
+        log_blockers "  blocker:" \
+          || log "  no app assertions found — not an app holding it; check 'pmset -g log' for the story"
+      fi
+    else
+      AWAKE_TICKS=0
+    fi
+    if [[ "$sd" == "1" ]] && lid_closed; then
       if [[ "$LID_WAS_CLOSED" == 0 ]]; then
         if console_locked; then
           LOCK_PENDING=0
@@ -470,7 +557,13 @@ cmd_watch() {
         if console_locked; then
           log "lock confirmed"
         else
-          log_warn "WARNING: lock did NOT take — an opened lid lands on your desktop. Check System Settings > Lock Screen: 'Require password after screen saver begins or display is turned off' (set it to 'Immediately')."
+          # Name the two moving parts before blaming the user's settings: is
+          # the screensaver we asked for even running, and what does the
+          # require-password delay actually say? Together they split "lock
+          # never armed" from "armed but the OS hasn't flipped IOConsoleLocked".
+          saver="not running"; pgrep -xq ScreenSaverEngine 2>/dev/null && saver="running"
+          screenlock="$(sysadminctl -screenLock status 2>&1 | sed -E 's/.*sysadminctl\[[^]]*\] //' || true)"
+          log_warn "WARNING: lock did NOT take — an opened lid lands on your desktop. (ScreenSaverEngine: ${saver}; ${screenlock:-screenLock status unreadable}; IOConsoleLocked still false)"
         fi
         LOCK_PENDING=0
       fi
@@ -672,9 +765,39 @@ cmd_status() {
   # Separate line from "lich:" because the two legitimately disagree: risen on
   # battery means this setting is off, and that is correct.
   if [[ "$(sleep_disabled)" == "1" ]]; then
-    echo "sleep:   disabled — lid-close keeps the Mac awake"
+    if on_ac; then
+      echo "sleep:   disabled — lid-close keeps the Mac awake"
+    else
+      # On battery the guarantee has an end — say which one, so a glance
+      # answers "will this thing sleep on its own if I walk away?". A ticking
+      # clock doubles as confirmation the timer checkbox is doing its job.
+      local sstate standing strip dl now_s
+      sstate="$(roam_state)"; standing="${sstate%% *}"; strip="${sstate#* }"
+      dl=""
+      case "$strip" in
+        until:*) dl="${strip#until:}" ;;
+      esac
+      if [[ -z "$dl" && "$strip" == "-" && "$standing" == "timer" ]]; then
+        dl="$(deadline_read)"
+      fi
+      now_s="$(date +%s)"
+      if [[ -n "$dl" && "$dl" -gt "$now_s" ]]; then
+        echo "sleep:   disabled — hands back to macOS at $(date -r "$dl" '+%H:%M') ($(( (dl - now_s + 59) / 60 )) min left)"
+      else
+        echo "sleep:   disabled — until plugged back in (or battery floor)"
+      fi
+    fi
   else
     echo "sleep:   normal — lid-close sleeps"
+  fi
+  # The other half of the sleep story: app power assertions block idle sleep
+  # with the lid open no matter what disablesleep says. Shown only when live,
+  # so a clean status stays five lines.
+  local blockers
+  blockers="$(sleep_blockers)"
+  if [[ -n "$blockers" ]]; then
+    echo "held awake by:"
+    printf '%s\n' "$blockers" | sed 's/^/         /'
   fi
   # Roaming and the battery are two lines, not one, for the same reason as
   # above: they legitimately disagree. "roam: always" with the battery under
