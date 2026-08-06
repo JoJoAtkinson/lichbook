@@ -428,9 +428,25 @@ console_locked() { ioreg -n Root -d1 -a 2>/dev/null | plutil -p - 2>/dev/null | 
 # snapshot; UserIsActive is a 2-minute input tickle that would name the user
 # for touching the trackpad.
 sleep_blockers() {
+  # Each line carries its pid through the pipe so the loop can name the
+  # parent — "started by claude" is the difference between a mystery
+  # caffeinate and a known one. Parent = launchd means "launched normally"
+  # (Dock, Finder, login) and is omitted as noise; a vanished parent (or a
+  # vanished blocker — these race) is omitted the same way.
+  local pid rest ppid parent
   "$PMSET" -g assertions 2>/dev/null | sed -nE \
-    's/^[[:space:]]*pid [0-9]+\(([^)]*)\): \[[^]]*\] ([0-9:]+) (NoDisplaySleepAssertion|PreventUserIdleDisplaySleep|PreventUserIdleSystemSleep|PreventSystemSleep|NoIdleSleepAssertion) named: "([^"]*)".*/\1 — \3 "\4" (held \2)/p' \
-    | grep -v 'Powerd - Prevent sleep while display is on' || true
+    's/^[[:space:]]*pid ([0-9]+)\(([^)]*)\): \[[^]]*\] ([0-9:]+) (NoDisplaySleepAssertion|PreventUserIdleDisplaySleep|PreventUserIdleSystemSleep|PreventSystemSleep|NoIdleSleepAssertion) named: "([^"]*)".*/\1|\2 — \4 "\5" (held \3)/p' \
+    | grep -v 'Powerd - Prevent sleep while display is on' \
+    | while IFS='|' read -r pid rest; do
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+        parent=""
+        [[ "$ppid" =~ ^[0-9]+$ && "$ppid" -gt 1 ]] \
+          && parent="$(ps -o comm= -p "$ppid" 2>/dev/null | sed 's|.*/||' || true)"
+        case "$parent" in
+          ""|launchd) printf '%s\n' "$rest" ;;
+          *)          printf '%s\n' "$rest — started by $parent" ;;
+        esac
+      done || true
 }
 
 # Write each live blocker to the log under a prefix. Returns 0 if anything was
