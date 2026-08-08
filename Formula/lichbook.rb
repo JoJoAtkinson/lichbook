@@ -1,8 +1,8 @@
 class Lichbook < Formula
   desc "Keep a MacBook awake with the lid closed - only while plugged in and logged in"
   homepage "https://github.com/JoJoAtkinson/lichbook"
-  url "https://github.com/JoJoAtkinson/lichbook/archive/refs/tags/v0.4.1.tar.gz"
-  sha256 "a85aeafb5437e76cffc8cb26870c9779ef350d94baba47678807488c955b4f14"
+  url "https://github.com/JoJoAtkinson/lichbook/archive/refs/tags/v0.4.2.tar.gz"
+  sha256 "df270c04de5e2edf3f158cf282b1f0b094be385009e38da8f9cff2b97e46847b"
   license "MIT"
 
   # The formula ships the CLI and nothing else. The menu bar app (menubar/) and
