@@ -114,7 +114,7 @@ else in this document is a deviation from this table.
 |---|---|---|---|
 | risen, AC, lid open | Never sleeps. Display may still sleep. `lich` shows `sleep: disabled` *(observed: `pmset -g` reports `SleepDisabled 1` under "System-wide power settings")* | Yes — `reconcile` sets `disablesleep 1` (lich:92-104) | Tested |
 | risen, AC, lid closed | Stays awake; console locked once, on the closing transition — subject to §4 | Yes — lich:133-140 | Tested |
-| risen, battery, lid open | Normal sleep. Status prints the "on battery — the lich rests" note | Yes — `want=0` (lich:94), note at lich:196-198 | Tested |
+| risen, battery, lid open | Normal sleep. With roam off, status prints the "on battery — the lich rests" note; with a roam mode set, the note names what that mode is doing instead (§14 Roaming) | Yes — `want=0` (lich:94), note at lich:196-198 | Tested |
 | risen, battery, lid closed | Sleeps like a normal Mac. lich does **not** lock — the lock rides along with macOS's own sleep | Yes — lock path is gated on `sleep_disabled == 1` (lich:133) | Tested |
 | at rest, AC, lid open | Normal in every way | Yes | Tested |
 | at rest, AC, lid closed | Sleeps | Yes | Tested |
@@ -585,6 +585,7 @@ is code-verified but **not yet field-tested on battery** — statuses say so.
 | Roam armed while still on AC | No effect until unplugged; plugging in before any battery use does **not** spend a one-shot (in-memory grant latch) | Yes | **Tested** (AC side) |
 | Watcher restart mid-roam | `always`/timed survive (file-backed); an unused `once` can survive one extra plug-in cycle (in-memory latch lost — documented tradeoff, lich comment at top of file) | Partial | Should-work |
 | Battery percentage unreadable (desktop Mac, format change) | Reads as 100% — floor never triggers; warned once in the log | Partial — fails toward awake | Untested |
+| Standing `timer`, its window already ended, still unplugged — what `lich status` says | Warns the window has **ENDED** and that lid-close will sleep this Mac now. Never the "roaming" note: the note reads the same live `SleepDisabled` the `sleep:` line does, so "normal — lid-close sleeps" and "roaming" cannot appear together | Yes — as of v0.4.2. Before it, the check compared the two-token `roam_state` against `"off"`, never matched, and printed "roaming" for every risen-on-battery state | **Tested** 2026-08-08: window opened 08:33:39, `standing timer window ended` 09:03:40 → `disablesleep=0`; `lich status` at 11:54 (2h50m past the deadline, roam `timer -`, battery 98%) printed the ENDED warning where the old code printed "note: roaming". The stale note had already cost a real session — a lid closed hours into a handed-back window |
 
 ## 15. Review-gate rulings (2026-08-02)
 

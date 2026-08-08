@@ -780,7 +780,11 @@ cmd_status() {
   echo "power:   $(power_source)"
   # Separate line from "lich:" because the two legitimately disagree: risen on
   # battery means this setting is off, and that is correct.
-  if [[ "$(sleep_disabled)" == "1" ]]; then
+  # Read ONCE and reuse for the on-battery note at the bottom: two reads could
+  # straddle a watcher tick and print the exact contradiction ("normal — lid-
+  # close sleeps" over "note: roaming") that note is there to make impossible.
+  local sleep_dis; sleep_dis="$(sleep_disabled)"
+  if [[ "$sleep_dis" == "1" ]]; then
     if on_ac; then
       echo "sleep:   disabled — lid-close keeps the Mac awake"
     else
@@ -828,13 +832,23 @@ cmd_status() {
     echo "raise it: ${C_ACT}lich on${C_OFF}    (stays awake with the lid closed while plugged in)"
   elif ! on_ac; then
     echo
-    if [[ "$(roam_state)" == "off" ]]; then
+    # The note follows the LIVE setting, never the roam mode alone: a standing
+    # timer still reads "timer" long after its window closed, and this branch
+    # used to answer "roaming" there while lid-close would have slept the Mac
+    # on the spot. Whatever "sleep:" printed above, this agrees with it.
+    # Ordering after that: the floor outranks every mode (see roam_active), so
+    # a suspended mode is named as suspended rather than as expired.
+    local rstanding; rstanding="$(roam_state)"; rstanding="${rstanding%% *}"
+    if [[ "$sleep_dis" == "1" ]]; then
+      echo "note: roaming — risen without the phylactery; 'lich done' when the work is finished"
+    elif [[ "$rstanding" != "off" && "$BATTERY_PCT" -le "$floor" ]]; then
+      echo "note: below the battery floor — roaming is suspended until you charge past it"
+    elif [[ "$rstanding" == "timer" ]]; then
+      echo "note: this unplug's grace window has ENDED — lid-close will sleep this Mac now"
+      echo "      (fresh window on the next unplug, or: ${C_ACT}lich roam always${C_OFF})"
+    else
       echo "note: on battery — the lich rests until the phylactery (AC power) returns"
       echo "      (or roam: lich roam — stay risen unplugged, down to the floor)"
-    elif [[ "$BATTERY_PCT" -le "$floor" ]]; then
-      echo "note: below the battery floor — roaming is off until you charge past it"
-    else
-      echo "note: roaming — risen without the phylactery; 'lich done' when the work is finished"
     fi
   fi
 }
