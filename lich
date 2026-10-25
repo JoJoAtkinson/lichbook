@@ -61,6 +61,8 @@ ROAM="$STATE_DIR/roam"             # "<standing>[ <trip>]": off|always|timer,
 CONFIG="$STATE_DIR/config"         # key=value lines: floor, roam_mins
 DEADLINE_LEGACY="$STATE_DIR/session-deadline"  # pre-v0.4.3 timer signpost;
                                    # the watcher deletes it at startup
+FLOOR_LATCH="$STATE_DIR/floor-reached"  # exists from the floor until a charge
+                                   # past floor+margin: roaming stays ended
 MENUBAR_ICON="$STATE_DIR/menubar-icon"  # the menu bar app's own verdict on
                                    # whether its icon is on screen
 PMSET="/usr/bin/pmset"             # absolute: the sudoers rule matches this
@@ -74,6 +76,8 @@ POLL_INTERVAL=5   # seconds between checks; the worst-case delay for a flag
 # is a worse tool than one that sleeps, so there is no override flag.
 DEFAULT_FLOOR=20        # percent
 DEFAULT_ROAM_MINS=30    # minutes, for `lich roam timer`
+FLOOR_RESUME_MARGIN=5   # points above the floor a charge must reach before
+                        # a floor-ended roam can resume (hysteresis)
 
 # How long the Mac may stay awake after lich hands sleep back to macOS before
 # the watcher goes looking for who is holding it up. Well past any sane
@@ -252,6 +256,18 @@ roam_write() {
   mv "$tmp" "$ROAM"
 }
 
+# The charge at which a floor-ended roam may resume: floor + margin, but no
+# higher than 80% — Optimized Battery Charging can hold a Mac there for days,
+# and a latch waiting for 81% would never clear — and always above the floor.
+floor_resume_pct() {
+  local f r
+  f="$(config_get floor "$DEFAULT_FLOOR")"
+  r=$(( f + FLOOR_RESUME_MARGIN ))
+  [[ "$r" -gt 80 ]] && r=80
+  [[ "$r" -le "$f" ]] && r=$(( f + 1 ))
+  echo "$r"
+}
+
 # Seconds since the last keyboard, mouse, or trackpad input (IOHIDSystem's
 # HIDIdleTime, in ns) — the clock the standing timer runs on. Empty when
 # unreadable. awk reads to EOF on purpose: quitting early would SIGPIPE ioreg,
@@ -320,15 +336,22 @@ roam_active() {
   # The floor outranks everything. A trip that hits it is spent — cleared, so
   # nothing silently resumes at 19%. A standing mode is only suspended: it is
   # the owner's preference, and it must survive to the next charge.
+  #
+  # And it LATCHES until the battery has charged FLOOR_RESUME_MARGIN points
+  # past the floor. Without that, a reading wobbling 20% → 21%, or a few
+  # minutes on the charger (field log, 2026-10-20), re-armed roaming only for
+  # the floor to end it again minutes later. A file, not watcher memory, so
+  # the CLI and the menu bar give the same answer as the watcher.
   floor="$(config_get floor "$DEFAULT_FLOOR")"
   read_battery
-  if [[ "$BATTERY_PCT" -le "$floor" ]]; then
+  if [[ "$BATTERY_PCT" -le "$floor" || -f "$FLOOR_LATCH" ]]; then
+    [[ -f "$FLOOR_LATCH" ]] || { mkdir -p "$STATE_DIR" && : > "$FLOOR_LATCH"; } 2>/dev/null || true
     if [[ -n "$ROAM_TRIP" ]]; then
       roam_write "$ROAM_STANDING" ""
       log "battery floor ${floor}% — trip roam canceled"
     fi
     if [[ "$ROAM_STANDING" != off && "$FLOOR_SUSPEND_LOGGED" == 0 ]]; then
-      log "battery floor ${floor}% — standing roam ($ROAM_STANDING) suspended until recharge"
+      log "battery floor ${floor}% — standing roam ($ROAM_STANDING) suspended until charged to $(floor_resume_pct)%"
       FLOOR_SUSPEND_LOGGED=1
     fi
     return 1
@@ -393,6 +416,13 @@ roam_on_ac() {
   fi
   ROAM_GRANTED_ON_BATTERY=0
   FLOOR_SUSPEND_LOGGED=0
+  if [[ -f "$FLOOR_LATCH" ]]; then
+    read_battery
+    if [[ "$BATTERY_PCT" -ge "$(floor_resume_pct)" ]]; then
+      rm -f "$FLOOR_LATCH" 2>/dev/null || true
+      log "charged to ${BATTERY_PCT}% — battery floor cleared, roaming can resume"
+    fi
+  fi
   TIMER_ENDED_LOGGED=0
 }
 
@@ -642,6 +672,16 @@ raise() {
 
 # Worth saying loudly: with no watcher, nothing will undo any of this on
 # unplug, on a timer, or at the battery floor.
+# Arming on battery after the floor has already ended this unplug's roaming:
+# the setting is saved, but it won't keep the Mac awake until the next
+# plug-in. Say so, rather than print 💀 and let lid-close surprise someone.
+warn_floor_latched() {
+  if [[ -f "$FLOOR_LATCH" ]]; then
+    echo "   (but the battery floor already ended roaming — this takes effect once charged to $(floor_resume_pct)%)"
+  fi
+  return 0
+}
+
 warn_no_watcher() {
   watcher_running || echo "warning: watcher not running — run: ${C_ACT}lich install${C_OFF}" >&2
 }
@@ -734,6 +774,7 @@ cmd_roam() {
       fi
       ;;
   esac
+  warn_floor_latched
   warn_no_watcher
 }
 
@@ -888,8 +929,8 @@ cmd_status() {
       echo "note: roaming — risen without the phylactery; 'lich done' when the work is finished"
     elif [[ "$sleep_dis" == "1" ]]; then
       echo "note: roaming — risen without the phylactery (standing setting: $rstanding)"
-    elif [[ "$rstanding" != "off" && "$BATTERY_PCT" -le "$floor" ]]; then
-      echo "note: below the battery floor — roaming is suspended until you charge past it"
+    elif [[ "$rstanding" != "off" && ( "$BATTERY_PCT" -le "$floor" || -f "$FLOOR_LATCH" ) ]]; then
+      echo "note: the battery floor ended roaming — it resumes once charged to $(floor_resume_pct)%"
     elif [[ "$rstanding" == "timer" ]]; then
       # Typing `lich status` is itself input, so an ended timer is usually
       # re-arming as you read this — say so, rather than claim it's over.
@@ -1094,8 +1135,11 @@ EOF
   #    controls; this branch really means "running from a clone".
   if command -v lich >/dev/null 2>&1; then
     st_link=skipped note_link="already on PATH"
-  elif [[ "$have_sudo" == 1 ]] && sudo mkdir -p "$(dirname "$CLI_LINK")" 2>/dev/null \
+  elif { [[ "$have_sudo" == 1 ]] || { sudo -v && have_sudo=1; }; } \
+       && sudo mkdir -p "$(dirname "$CLI_LINK")" 2>/dev/null \
        && sudo ln -sf "$self" "$CLI_LINK" 2>/dev/null; then
+    # (A working sudoers rule skips the up-front prompt, so a clone whose
+    # link went missing asks here — the one case that still needs it.)
     st_link=ok
   else
     note_link="could not create $CLI_LINK — run it as: $self"
@@ -1448,7 +1492,8 @@ asked to roam.
 
 Roaming is the one exception, and it has a hard floor: at or below the
 battery floor (20% by default) roaming ends — a once/timed roam is canceled,
-an 'always' roam is suspended until you charge past it. There is no override.
+a standing roam is suspended until you charge 5 points past the floor.
+There is no override.
 
 The flag lives in ~/.lich/desired-state ("on"/"off") — the menu bar app and
 Control Center toggle flip the same flag, and the watcher acts on it within

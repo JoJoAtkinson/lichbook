@@ -132,7 +132,9 @@ than one that sleeps.
   trip is cleared, your standing setting is kept, and the log says why. Plug
   in, and re-arm it if you still want it.
 - `always` is **suspended**, not cleared: your standing preference survives
-  the low battery and takes effect again once you're back above the floor.
+  the low battery and takes effect again once you've charged 5 points past
+  the floor (25% by default). A few minutes on the charger, or a reading
+  that wobbles back up a point, won't re-arm it at 21% just to end again.
 
 The floor is checked every tick, alongside everything else, so a roam ends
 within ~5 seconds of crossing it — lid open or closed.
