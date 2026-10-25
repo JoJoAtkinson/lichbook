@@ -189,7 +189,7 @@ no `kCGSSessionOnConsoleKey`, no `IOConsoleUsers`).
 | Configuration | Expected behavior | Code handles it? | Support |
 |---|---|---|---|
 | Normal console login | Agent runs at login (`RunAtLoad`), full behavior | Yes — lich:270 | Tested |
-| Log out to login window while risen | launchd SIGTERMs the watcher → trap restores `disablesleep 0` → Mac sleeps normally | Yes — the central guarantee (lich:106-114) | Tested |
+| Log out to login window while risen | launchd SIGTERMs the watcher → trap restores `disablesleep 0` → Mac sleeps normally | Yes — the central guarantee. **Fixed v0.4.3:** before, `trap cleanup TERM` ran cleanup and then *resumed* the loop, which could re-arm `disablesleep 1` before launchd's SIGKILL (log: `watcher down` followed in the same second by `-> disablesleep=1`). TERM now exits; cleanup runs once from the EXIT trap, and the 5s sleep is `sleep & wait` so the trap fires at once | Should-work — re-test after v0.4.3 (was marked Tested on evidence the bug masked) |
 | Log out **while the lid is already closed** and risen | Same: trap fires, sleep restored, Mac sleeps | Yes | Should-work |
 | Screen locked (Ctrl-Cmd-Q) while risen | Session still logged in → watcher alive → stays awake. Correct, and the headline feature. *(observed: a session can report `kCGSSessionOnConsoleKey: true` and `CGSSessionScreenIsLocked: true` simultaneously — locked and on-console are independent, and lich consults neither)* | Yes | Should-work |
 | Fast-user-switch away (user A risen, stays logged in; B is at the front) | A's agent keeps running, so the machine stays awake while B uses it. Settled, not speculative *(source: Apple FUS documentation)*. The README's "only while you're logged in" framing does not cover "logged in but switched away" | **No** — no notion of who owns the console | Known-gap → **Q4** |
@@ -534,7 +534,7 @@ measured read-only on the maintainer's Mac (26.5.2 / 25F84, 2026-08-02).
 | `disablesleep` is a single **system-wide** boolean, not per-power-source: it prints under "System-wide power settings" and is absent from `pmset -g custom`; `pmset -a` is cosmetic for this key | breaks-core | observed | The entire "AC only" rule is lich's 5s poll and nothing else. With no watcher, a stale `1` keeps the Mac awake **on battery** too (§1, §2) |
 | Whether macOS's critical-battery emergency sleep/hibernate is gated by `SleepDisabled` or overrides it | unknown | nothing authoritative found | Unknown. If gated, a stale `1` with no watcher could run a MacBook to a hard cut-off rather than hibernating (data loss). **The single highest-value bench test:** set `disablesleep 1`, kill the watcher, unplug, drain |
 | Starting ScreenSaverEngine locks nothing by itself — the lock comes from "Require password after screen saver begins or display is turned off" | breaks-core | Apple discussions 254918945; dev forums 778916; observed (`sysadminctl -screenLock status` → "immediate" here) | With a delay or Never, lid-close does not lock, and because lich blocks the sleep it also removes the lock macOS would have applied. lich logs "screen locked" regardless and never retries (§4) |
-| Tahoe 26 lock-screen regressions: exiting the screensaver inside the password grace period shows a lock image without prompting; lid close/reopen inside a 5-minute grace window lands on the live desktop | degrades | discussions.apple.com 256165873; dev forums 787444; **field-confirmed 2026-08-02**: same machine, same "immediate" setting — lock verification failed at 17:04 and 17:10 but succeeded by 17:38 (IOConsoleLocked=true). Intermittent, not configuration | As of v0.2.0 lich re-checks on the next tick and logs "lock confirmed" or a loud WARNING — the intermittence is now visible in the log instead of silent (§4) |
+| Tahoe 26 lock-screen regressions: exiting the screensaver inside the password grace period shows a lock image without prompting; lid close/reopen inside a 5-minute grace window lands on the live desktop | degrades | discussions.apple.com 256165873; dev forums 787444; **field-confirmed 2026-08-02**: same machine, same "immediate" setting — lock verification failed at 17:04 and 17:10 but succeeded by 17:38 (IOConsoleLocked=true). Intermittent, not configuration. **Correction (v0.4.3):** these verdicts are void — `console_locked()` piped ~110 KB into `grep -q`, plutil died of SIGPIPE, and under `pipefail` the probe returned "not locked" every time (252 warnings, 0 confirmations in the log). Re-tally after v0.4.3 | As of v0.2.0 lich re-checks on the next tick and logs "lock confirmed" or a loud WARNING — the intermittence is now visible in the log instead of silent (§4) |
 | Tahoe moved Screen Saver settings into a modal inside Wallpaper | info | same thread cluster | Users are less likely to have ever seen the setting lich silently depends on (§4) |
 | Fast user switching does not stop a switched-out user's LaunchAgents — *"Processes in a switched-out login session continue running as before"* | breaks-core | Apple, *Multiple User Environments* (FUS) | Two lich users with opposite intent write the one global setting every ~5s each; the lid-close outcome is decided by whichever ticked last (§10). Also: a switched-away risen user keeps the whole Mac awake (§3) |
 | Screen Sharing **as a different user** opens a second Aqua session with its own LaunchAgents | degrades | Apple FUS doc; macworld; mac-forums | The realistic route into the flip-flop above — reached without anyone consciously switching users (§10) |
@@ -565,8 +565,18 @@ measured read-only on the maintainer's Mac (26.5.2 / 25F84, 2026-08-02).
 > setting. The rows below were tested against v0.2.x single-value semantics;
 > their *mechanics* (floor, expiry precision, spend-on-AC) carry over to
 > trips unchanged, but "cleared to off" now means "trip cleared, standing
-> revealed". Standing-timer per-unplug renewal is new in v0.3.0 and
-> **Untested** until it happens in the field.
+> revealed".
+>
+> **v0.4.3 change:** the standing `timer` is now **idle-based**: unplugged,
+> it holds `disablesleep 1` while HIDIdleTime (keyboard/trackpad) is under
+> `roam_mins`, and hands sleep back once it reaches it. Any input re-arms it.
+> Before, the window started at unplug, which the field log showed ending
+> under active use (most of the 50 overdue-sleep warnings) and being
+> re-granted by every watcher restart and CLI call. Now it's stateless:
+> every caller computes the same answer, and a restart can't extend it.
+> `~/.lich/session-deadline` is gone (the watcher deletes it). Remote work
+> (ssh, Claude) isn't HID input, so it doesn't extend the timer. Use a trip
+> for that. **Untested** in the field.
 
 Battery keep-awake ("roam") rows, authored by the review gate after the
 feature landed. The AC-side paths were exercised live; the battery-side logic
@@ -577,7 +587,7 @@ is code-verified but **not yet field-tested on battery** — statuses say so.
 | Risen, on battery, `once` armed, above floor | Awake, lid open or closed (lid-close still locks); next return to AC spends the one-shot, logged | Yes — `roam_active` / `roam_on_ac` | Should-work |
 | Risen, on battery, `always`, above floor | Awake indefinitely while above the floor | Yes | Should-work |
 | Timed roam expires on battery | Sleeps within ~5s; roam cleared to `off`, logged once (watcher is the only writer of expiry) | Yes | **Tested** 2026-08-03: 30-min roam armed 10:19:03, lid closed, no power; heartbeat = 29/29 consecutive minute-beats (fully available all window); `roam timer expired` + release at 10:49:05 (**+2s** past deadline); asleep before the next minute-beat; battery 100% → 100% |
-| Risen + roam active on battery, lid closes | Held awake by the roam grant; the lid-close lock fires exactly as on AC | Yes — lock path gated on `sleep_disabled == 1`, which roam satisfies | **Tested** 2026-08-03: lock requested 10:22:21 while roaming on battery (verification failed — Tahoe intermittence, tally 3 fail / 1 success; availability unaffected) |
+| Risen + roam active on battery, lid closes | Held awake by the roam grant; the lid-close lock fires exactly as on AC | Yes — lock path gated on `sleep_disabled == 1`, which roam satisfies | **Tested** 2026-08-03: lock requested 10:22:21 while roaming on battery (the "verification failed" verdict is void — probe bug fixed in v0.4.3, see §14; availability unaffected) |
 | `once`/timed roam hits the floor (default 20%) | Canceled outright; sleeps within ~5s; nothing silently resumes at 19% | Yes | Should-work |
 | `always` roam hits the floor | **Suspended, not cleared** — sleeps below floor, standing preference survives to the next charge | Yes | Should-work |
 | Roam armed but watcher dead | Nothing enforces the floor or timer — the flags are inert, and a stale `disablesleep 1` stays | No — the watcher *is* the enforcement | Known-gap |

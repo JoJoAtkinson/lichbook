@@ -1,0 +1,19 @@
+{
+  "name": "lichbook",
+  "owner": {
+    "name": "Joseph Atkinson",
+    "url": "https://github.com/JoJoAtkinson"
+  },
+  "metadata": {
+    "description": "The official Claude Code skill for lichbook: keep a MacBook awake with the lid closed while Claude works."
+  },
+  "plugins": [
+    {
+      "name": "lichbook",
+      "source": "./",
+      "description": "Install, drive, and troubleshoot lichbook (the `lich` CLI) so long Claude sessions survive a closed lid, and hand the Mac back when the work is done.",
+      "category": "productivity",
+      "tags": ["macos", "sleep", "keep-awake", "lid-closed", "clamshell"]
+    }
+  ]
+}

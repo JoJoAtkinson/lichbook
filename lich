@@ -50,15 +50,19 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 # Per-user filename, so a second user's install can never clobber the first
 # user's rule (each install/uninstall touches only its own file). Dots are
 # stripped because #includedir silently ignores filenames containing them.
-SUDOERS="/etc/sudoers.d/lichbook-${USER//./_}"
+LICH_USER="${USER:-$(id -un)}"     # USER can be unset in sanitized envs
+SUDOERS="/etc/sudoers.d/lichbook-${LICH_USER//./_}"
 SUDOERS_LEGACY="/etc/sudoers.d/lichbook"   # pre-v0.3.2 shared filename
 LOG_FILE="$HOME/Library/Logs/lich.log"
 STATE_DIR="$HOME/.lich"            # sandboxed Control Center widget writes here
 FLAG="$STATE_DIR/desired-state"    # contents: "on" (risen) or "off" (at rest)
-ROAM="$STATE_DIR/roam"             # "off" | "once" | "always" | "until <epoch>"
+ROAM="$STATE_DIR/roam"             # "<standing>[ <trip>]": off|always|timer,
+                                   # then optionally once | until <epoch>
 CONFIG="$STATE_DIR/config"         # key=value lines: floor, roam_mins
-DEADLINE="$STATE_DIR/session-deadline"  # epoch when a live standing-timer
-                                   # window ends — written for DISPLAY only
+DEADLINE_LEGACY="$STATE_DIR/session-deadline"  # pre-v0.4.3 timer signpost;
+                                   # the watcher deletes it at startup
+MENUBAR_ICON="$STATE_DIR/menubar-icon"  # the menu bar app's own verdict on
+                                   # whether its icon is on screen
 PMSET="/usr/bin/pmset"             # absolute: the sudoers rule matches this
                                    # exact string, so every caller must too
 POLL_INTERVAL=5   # seconds between checks; the worst-case delay for a flag
@@ -79,15 +83,14 @@ AWAKE_WARN_MINS=15
 # Watcher memory — meaningful only inside the `watch` loop, where the process
 # lives for the whole session. Deliberately not persisted: a watcher restart
 # forgetting these is acceptable (worst case, an armed one-shot survives one
-# extra plug-in, a suspension is logged twice, or a standing-timer window
-# restarts from the watcher's start rather than the unplug — every failure
+# extra plug-in, or a suspension is logged twice — every failure
 # leans toward awake, never toward data loss).
 ROAM_GRANTED_ON_BATTERY=0   # a "once" trip actually held the Mac awake off AC
 FLOOR_SUSPEND_LOGGED=0      # standing-mode floor suspension: log once, not 12/min
 BATTERY_UNREADABLE_LOGGED=0 # ditto for an unparsable battery reading
 BATTERY_PCT=100             # last reading; set by read_battery, never read raw
-ROAM_SESSION_DEADLINE=""    # standing-timer: this battery session's cutoff epoch
-TIMER_ENDED_LOGGED=0        # standing-timer window end: log once per session
+TIMER_ENDED_LOGGED=0        # standing timer handed sleep back: log once per
+                            # idle stretch (input re-arms it, and this)
 AWAKE_TICKS=0               # consecutive battery ticks with disablesleep=0;
                             # ticks freeze while the Mac sleeps, so this
                             # approximates awake time that macOS owns
@@ -200,8 +203,8 @@ config_set() {
 #
 #   STANDING mode — the owner's preference, which persists until the owner
 #   changes it: `off` (unplugged means sleep), `always` (unplugged never
-#   means sleep), or `timer` (every unplug gets roam_mins of grace, then
-#   sleep — and the NEXT unplug gets a fresh window; the setting stays).
+#   means sleep), or `timer` (unplugged, it stays awake until nobody has
+#   touched it for roam_mins, then sleeps; any input re-arms it).
 #
 #   TRIP — a temporary overlay: `once` (until the cord returns) or
 #   `until <epoch>` (a bounded window, e.g. `lich roam 45`). A trip rides on
@@ -249,24 +252,13 @@ roam_write() {
   mv "$tmp" "$ROAM"
 }
 
-# The standing-timer window's end, persisted so status and the menu can show
-# "hands back to macOS at HH:MM" — the answer to "will this sleep if I walk
-# away?", which pure watcher memory couldn't give them. The watcher's
-# in-memory ROAM_SESSION_DEADLINE stays the authority; this file is a
-# signpost, and a stale one is harmless because readers gate on the live
-# state (disablesleep, battery, timer standing) before showing it.
-deadline_write() {
-  local tmp
-  mkdir -p "$STATE_DIR"
-  tmp="$STATE_DIR/.deadline.$$"
-  printf '%s\n' "$1" > "$tmp"
-  mv "$tmp" "$DEADLINE"
-}
-deadline_clear() { rm -f "$DEADLINE" 2>/dev/null || true; }
-deadline_read() {
-  local v
-  v="$(cat "$DEADLINE" 2>/dev/null || true)"
-  [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo ""
+# Seconds since the last keyboard, mouse, or trackpad input (IOHIDSystem's
+# HIDIdleTime, in ns) — the clock the standing timer runs on. Empty when
+# unreadable. awk reads to EOF on purpose: quitting early would SIGPIPE ioreg,
+# and under pipefail that reads as failure (see console_locked).
+idle_seconds() {
+  ioreg -c IOHIDSystem -d 4 2>/dev/null \
+    | awk '/HIDIdleTime/ && !f {printf "%d\n", $NF / 1000000000; f = 1}'
 }
 
 # The machine-readable state, EXACTLY two tokens on one line:
@@ -299,7 +291,7 @@ roam_human() {
   mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
   case "$standing" in
     always) standing_desc="always — stays risen unplugged" ;;
-    timer)  standing_desc="timer — ${mins} min of grace at every unplug" ;;
+    timer)  standing_desc="timer — stays risen unplugged until ${mins} min idle" ;;
     *)      standing_desc="off — unplugged means sleep" ;;
   esac
   case "$trip" in
@@ -321,7 +313,7 @@ roam_human() {
 # are state changes the watcher owns. Standing modes are NEVER written here —
 # only the owner (roam off / roam always / roam timer) changes those.
 roam_active() {
-  local floor epoch now mins
+  local floor epoch mins idle
   roam_read
   [[ "$ROAM_STANDING" == off && -z "$ROAM_TRIP" ]] && return 1
 
@@ -364,21 +356,24 @@ roam_active() {
   case "$ROAM_STANDING" in
     always) return 0 ;;
     timer)
-      now="$(date +%s)"
-      if [[ -z "$ROAM_SESSION_DEADLINE" ]]; then
-        # First battery tick of this session: the grace window starts now.
-        # (After a watcher restart mid-session it restarts from here — a
-        # fresh window, failing toward awake; documented tradeoff.)
-        mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
-        ROAM_SESSION_DEADLINE=$(( now + mins * 60 ))
-        deadline_write "$ROAM_SESSION_DEADLINE"
-        log "unplugged with standing timer — ${mins} min grace window begins"
-      fi
-      if [[ "$now" -lt "$ROAM_SESSION_DEADLINE" ]]; then
+      # Awake until nobody has touched the Mac for roam_mins — measured from
+      # the last keyboard/trackpad input, not from the unplug. So a Mac in
+      # active use never runs out of grace under you, walking away (or
+      # closing the lid) starts the countdown, and any input re-arms it.
+      # Stateless on purpose: the watcher, a CLI call, a menu click and a
+      # restarted watcher all compute the same answer from the same clock.
+      mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
+      idle="$(idle_seconds)"
+      if [[ "$idle" =~ ^[0-9]+$ && "$idle" -lt $(( mins * 60 )) ]]; then
+        TIMER_ENDED_LOGGED=0
         return 0
       fi
       if [[ "$TIMER_ENDED_LOGGED" == 0 ]]; then
-        log "standing timer window ended — sleep handed back to macOS until the next unplug (setting kept)"
+        if [[ "$idle" =~ ^[0-9]+$ ]]; then
+          log "standing timer: idle ${mins} min on battery — sleep handed back to macOS (any input re-arms it)"
+        else
+          log "standing timer: idle time unreadable — sleep handed back to macOS"
+        fi
         TIMER_ENDED_LOGGED=1
       fi
       return 1
@@ -398,8 +393,6 @@ roam_on_ac() {
   fi
   ROAM_GRANTED_ON_BATTERY=0
   FLOOR_SUSPEND_LOGGED=0
-  ROAM_SESSION_DEADLINE=""
-  deadline_clear
   TIMER_ENDED_LOGGED=0
 }
 
@@ -415,9 +408,19 @@ sleep_disabled() {
 
 watcher_running() { launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; }
 
-lid_closed() { ioreg -r -k AppleClamshellState -d 1 2>/dev/null | grep -q '"AppleClamshellState" = Yes'; }
+lid_closed() {
+  ioreg -r -k AppleClamshellState -d 1 2>/dev/null \
+    | awk '/"AppleClamshellState" = Yes/ {f = 1} END {exit !f}'
+}
 
-console_locked() { ioreg -n Root -d1 -a 2>/dev/null | plutil -p - 2>/dev/null | grep -q '"IOConsoleLocked" => true'; }
+# Both probes read their whole input (awk, not grep -q): IOConsoleLocked sits
+# on line 2 of ~110 KB of plutil output, so `grep -q` quits early, plutil dies
+# of SIGPIPE, and under pipefail the probe reported "not locked" every single
+# time — 252 false "lock did NOT take" warnings before anyone noticed.
+console_locked() {
+  ioreg -n Root -d1 -a 2>/dev/null | plutil -p - 2>/dev/null \
+    | awk '/"IOConsoleLocked" => true/ {f = 1} END {exit !f}'
+}
 
 # Who ELSE is keeping the Mac awake. disablesleep is lich's lever; power
 # assertions are everyone else's — a playing video, a Zoom call, a stray
@@ -433,7 +436,7 @@ sleep_blockers() {
   # caffeinate and a known one. Parent = launchd means "launched normally"
   # (Dock, Finder, login) and is omitted as noise; a vanished parent (or a
   # vanished blocker — these race) is omitted the same way.
-  local pid rest ppid parent
+  local pid rest ppid parent held stuck
   "$PMSET" -g assertions 2>/dev/null | sed -nE \
     's/^[[:space:]]*pid ([0-9]+)\(([^)]*)\): \[[^]]*\] ([0-9:]+) (NoDisplaySleepAssertion|PreventUserIdleDisplaySleep|PreventUserIdleSystemSleep|PreventSystemSleep|NoIdleSleepAssertion) named: "([^"]*)".*/\1|\2 — \4 "\5" (held \3)/p' \
     | grep -v 'Powerd - Prevent sleep while display is on' \
@@ -442,9 +445,17 @@ sleep_blockers() {
         parent=""
         [[ "$ppid" =~ ^[0-9]+$ && "$ppid" -gt 1 ]] \
           && parent="$(ps -o comm= -p "$ppid" 2>/dev/null | sed 's|.*/||' || true)"
+        # Held for half a day or more = almost certainly stuck, not working:
+        # the field log caught a Finder "force_move" assertion held for 12
+        # days, quietly keeping the Mac from idle-sleeping on battery. Say
+        # what clears it, because nothing about lich can.
+        held="${rest##*(held }"; held="${held%%:*}"
+        stuck=""
+        [[ "$held" =~ ^[0-9]+$ && "$held" -ge 12 ]] \
+          && stuck=" — held ${held}h, probably stuck: quit or relaunch it to release"
         case "$parent" in
-          ""|launchd) printf '%s\n' "$rest" ;;
-          *)          printf '%s\n' "$rest — started by $parent" ;;
+          ""|launchd) printf '%s\n' "$rest$stuck" ;;
+          *)          printf '%s\n' "$rest — started by $parent$stuck" ;;
         esac
       done || true
 }
@@ -511,12 +522,22 @@ cleanup() {
   # session, no watcher, no disablesleep. Best-effort, because an exit path
   # must never fail; a SIGKILL or panic skips it and the next reconcile fixes
   # it at your next login.
-  sudo -n "$PMSET" -a disablesleep 0 2>/dev/null || true
-  log "watcher down — normal sleep restored"
+  if sudo -n "$PMSET" -a disablesleep 0 2>/dev/null; then
+    log "watcher down — normal sleep restored"
+  else
+    log "ERROR: watcher down but 'sudo pmset' was refused — sleep may still be disabled (fix: sudo pmset -a disablesleep 0)"
+  fi
 }
 
 cmd_watch() {
-  trap cleanup EXIT INT TERM
+  # A trapped signal in bash runs its handler and then RESUMES the script, so
+  # `trap cleanup TERM` alone restored sleep at logout and then let the loop
+  # re-arm disablesleep=1 on its next tick. TERM/INT therefore just exit;
+  # the EXIT trap does the cleanup, exactly once.
+  trap cleanup EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  rm -f "$DEADLINE_LEGACY" 2>/dev/null || true
   log "watcher up (pid $$)"
 
   # Plain polling, on purpose — not an oversight. `pmset -g pslog` looks like
@@ -536,10 +557,17 @@ cmd_watch() {
   # unlock over Screen Sharing with the lid down is never fought.
   LID_WAS_CLOSED=0
   LOCK_PENDING=0
-  local sd saver screenlock
+  local sd saver screenlock power last_power=""
   while :; do
     reconcile || exit $?   # broken sudoers = die loudly; launchd retries
     sd="$(sleep_disabled)"
+    # Every plug and unplug, on the record — otherwise a replug that leaves
+    # disablesleep unchanged (risen, roaming → AC) leaves no trace at all.
+    on_ac && power=AC || power=battery
+    if [[ -n "$last_power" && "$power" != "$last_power" ]]; then
+      log "power: $last_power -> $power"
+    fi
+    last_power="$power"
     # Overdue-sleep watchdog. Once lich lets go on battery, macOS should sleep
     # the Mac within its own idle timers — minutes. If we are still ticking
     # AWAKE_WARN_MINS later, something is holding it awake, and the whole
@@ -587,7 +615,11 @@ cmd_watch() {
       LID_WAS_CLOSED=0
       LOCK_PENDING=0
     fi
-    sleep "$POLL_INTERVAL"
+    # Backgrounded + wait: bash defers a trap until the foreground command
+    # finishes, but `wait` is interrupted at once — so logout gets an
+    # immediate cleanup instead of one up to POLL_INTERVAL later.
+    sleep "$POLL_INTERVAL" &
+    wait $! || true
   done
 }
 
@@ -677,13 +709,13 @@ cmd_roam() {
       echo "💀 roaming always — unplugging no longer rests the lich (floor ${floor}% still does)"
       ;;
     timer)
-      # Standing preference: EVERY unplug gets a fresh grace window; the
-      # setting persists until `lich roam off`.
+      # Standing preference: unplugged, stay awake until roam_mins without
+      # input; the setting persists until `lich roam off`.
       mins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"
       roam_write timer ""
       raise
-      log "cmd: roam timer (standing, ${mins}m per unplug)"
-      echo "💀 roaming on a timer — every unplug gets ${mins} min of grace, then sleep (floor ${floor}%; setting persists)"
+      log "cmd: roam timer (standing, ${mins}m idle)"
+      echo "💀 roaming on a timer — unplugged, stays awake until ${mins} min without use, then sleeps (floor ${floor}%; setting persists)"
       ;;
     *)
       # `lich roam 45` / `45m`: a bounded trip — this window only, standing kept.
@@ -758,6 +790,10 @@ cmd_config() {
       [[ "$val" == 0 || "$val" == 1 ]] || die "config no_app: 0 (install the menu bar app) or 1 (CLI only)"
       config_set no_app "$val"
       echo "no_app=$val"
+      if [[ "$val" == 1 && -d /Applications/Lich.app ]]; then
+        remove_menubar_app
+        echo "menu bar app removed (lich config no_app 0 && lich install brings it back)"
+      fi
       ;;
     *)
       die "unknown config key: $key (known: floor, roam_mins, no_app)"
@@ -791,18 +827,27 @@ cmd_status() {
       # On battery the guarantee has an end — say which one, so a glance
       # answers "will this thing sleep on its own if I walk away?". A ticking
       # clock doubles as confirmation the timer checkbox is doing its job.
-      local sstate standing strip dl now_s
+      local sstate standing strip dl now_s idle when=""
       sstate="$(roam_state)"; standing="${sstate%% *}"; strip="${sstate#* }"
       dl=""
+      now_s="$(date +%s)"
       case "$strip" in
         until:*) dl="${strip#until:}" ;;
       esac
       if [[ -z "$dl" && "$strip" == "-" && "$standing" == "timer" ]]; then
-        dl="$(deadline_read)"
+        # Idle-based: the deadline moves every time someone touches the Mac.
+        # Run from a terminal it reads the full window (you just typed);
+        # over ssh with the lid shut it is a real countdown.
+        idle="$(idle_seconds)"
+        if [[ "$idle" =~ ^[0-9]+$ ]]; then
+          dl=$(( now_s - idle + $(config_get roam_mins "$DEFAULT_ROAM_MINS") * 60 ))
+          when=" if left untouched"
+        fi
       fi
-      now_s="$(date +%s)"
       if [[ -n "$dl" && "$dl" -gt "$now_s" ]]; then
-        echo "sleep:   disabled — hands back to macOS at $(date -r "$dl" '+%H:%M') ($(( (dl - now_s + 59) / 60 )) min left)"
+        echo "sleep:   disabled — hands back to macOS at $(date -r "$dl" '+%H:%M')${when} ($(( (dl - now_s + 59) / 60 )) min left)"
+      elif [[ -n "$when" ]]; then
+        echo "sleep:   disabled — handing back to macOS within ~5 seconds (idle past the timer)"
       else
         echo "sleep:   disabled — until plugged back in (or battery floor)"
       fi
@@ -838,14 +883,23 @@ cmd_status() {
     # on the spot. Whatever "sleep:" printed above, this agrees with it.
     # Ordering after that: the floor outranks every mode (see roam_active), so
     # a suspended mode is named as suspended rather than as expired.
-    local rstanding; rstanding="$(roam_state)"; rstanding="${rstanding%% *}"
-    if [[ "$sleep_dis" == "1" ]]; then
+    local rnow rstanding; rnow="$(roam_state)"; rstanding="${rnow%% *}"
+    if [[ "$sleep_dis" == "1" && "${rnow#* }" != "-" ]]; then
       echo "note: roaming — risen without the phylactery; 'lich done' when the work is finished"
+    elif [[ "$sleep_dis" == "1" ]]; then
+      echo "note: roaming — risen without the phylactery (standing setting: $rstanding)"
     elif [[ "$rstanding" != "off" && "$BATTERY_PCT" -le "$floor" ]]; then
       echo "note: below the battery floor — roaming is suspended until you charge past it"
     elif [[ "$rstanding" == "timer" ]]; then
-      echo "note: this unplug's grace window has ENDED — lid-close will sleep this Mac now"
-      echo "      (fresh window on the next unplug, or: ${C_ACT}lich roam always${C_OFF})"
+      # Typing `lich status` is itself input, so an ended timer is usually
+      # re-arming as you read this — say so, rather than claim it's over.
+      local rmins ridle; rmins="$(config_get roam_mins "$DEFAULT_ROAM_MINS")"; ridle="$(idle_seconds)"
+      if [[ "$ridle" =~ ^[0-9]+$ && "$ridle" -lt $(( rmins * 60 )) ]]; then
+        echo "note: timer re-arming — you're active again, so it stays awake within ~5 seconds"
+      else
+        echo "note: idle ${rmins}+ min — the timer handed sleep back; lid-close will sleep this Mac now"
+        echo "      (any input re-arms it, or: ${C_ACT}lich roam always${C_OFF})"
+      fi
     else
       echo "note: on battery — the lich rests until the phylactery (AC power) returns"
       echo "      (or roam: lich roam — stay risen unplugged, down to the floor)"
@@ -871,8 +925,66 @@ sync_menubar_app() {
   pkill -f lich-menubar 2>/dev/null
   rm -rf /Applications/Lich.app 2>/dev/null
   cp -R "$src" /Applications/Lich.app 2>/dev/null || return 2
+  rm -f "$MENUBAR_ICON" 2>/dev/null   # so menubar_verify reads a fresh verdict
   open /Applications/Lich.app 2>/dev/null
   return 0
+}
+
+# Take the menu bar app back out: login item first (an entry pointing at a
+# deleted bundle lingers in System Settings), then the process, then the
+# bundle. Only builds that know --unregister-login-item get asked — an older binary would
+# treat the flag as a normal launch and never exit.
+remove_menubar_app() {
+  local bin=/Applications/Lich.app/Contents/MacOS/lich-menubar
+  [[ -d /Applications/Lich.app ]] || return 0
+  if LC_ALL=C grep -aq -- '--unregister-login-item' "$bin" 2>/dev/null; then
+    "$bin" --unregister-login-item 2>/dev/null || true
+  fi
+  pkill -x lich-menubar 2>/dev/null || true
+  rm -rf /Applications/Lich.app 2>/dev/null || true
+}
+
+# Did the 💀 actually appear? "The app launched" is not the same thing: on
+# plenty of Macs it runs fine with its icon hidden (macOS 26's per-app menu
+# bar switch, a full menu bar behind the notch, a menu bar manager). The app
+# checks for itself a few seconds after launch and writes its verdict to
+# $MENUBAR_ICON; this waits for that. Prints one word: visible | hidden |
+# unknown (screen locked/asleep, or the app is older than the check) |
+# not-running.
+menubar_verify() {
+  local i=0
+  while [[ "$i" -lt 50 ]]; do
+    [[ -s "$MENUBAR_ICON" ]] && break
+    sleep 0.2; i=$((i + 1))
+  done
+  if ! pgrep -x lich-menubar >/dev/null 2>&1; then
+    echo not-running
+  else
+    local v; v="$(head -1 "$MENUBAR_ICON" 2>/dev/null || true)"
+    echo "${v:-unknown}"
+  fi
+}
+
+# What to do by hand when the icon isn't there. Same causes, same order, as
+# the app's own alert (menubar/LichMenuBar.swift) — keep the two in step.
+menubar_help() {
+  case "$1" in
+    hidden)
+      echo "The menu bar app is running, but its 💀 isn't visible. Usually one of:"
+      echo "  • System Settings → Menu Bar → \"Allow in the Menu Bar\": turn Lich on"
+      echo "  • A notch MacBook with a full menu bar: the icon is behind the notch —"
+      echo "    quit a few menu bar apps, or hold ⌘ and drag icons out to make room"
+      echo "  • A menu bar manager (Bartender, Ice, Hidden Bar…): reveal Lich there"
+      echo "Then: ${C_ACT}open /Applications/Lich.app${C_OFF}   (lich itself works without the icon)"
+      ;;
+    not-running)
+      echo "The menu bar app didn't stay running. Try launching it by hand:"
+      echo "  ${C_ACT}open /Applications/Lich.app${C_OFF}"
+      echo "If macOS refuses it (\"damaged\" / \"can't be opened\"), rebuild it on this Mac:"
+      echo "  ${C_ACT}brew reinstall lichbook && lich install${C_OFF}   (from a clone: make -C menubar && lich install)"
+      echo "lich itself works without the app: lich status / lich on / lich off."
+      ;;
+  esac
 }
 
 cmd_install() {
@@ -954,7 +1066,7 @@ cmd_install() {
     cat > "$tmp" <<EOF
 # lichbook: allow toggling lid-close sleep without a password.
 # Scoped to exactly these two commands — nothing else.
-$USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1
+$LICH_USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1
 EOF
     if ! sudo /usr/sbin/visudo -cf "$tmp" >/dev/null 2>&1; then
       note_sudoers="generated rule failed visudo validation — nothing was written"
@@ -1039,7 +1151,15 @@ EOF
   elif [[ "$st_plist" != ok ]]; then
     st_agent=skipped note_agent="not loaded — no plist"
   else
+    # bootout first: kickstart -k restarts the definition launchd already
+    # has, so a plist rewritten to a new path (clone → brew) would keep
+    # running the old script until the next login.
     launchctl enable "gui/$UID/$LABEL" 2>/dev/null
+    if watcher_running; then
+      launchctl bootout "gui/$UID/$LABEL" 2>/dev/null
+      i=0
+      while watcher_running && [[ "$i" -lt 25 ]]; do sleep 0.2; i=$((i + 1)); done
+    fi
     launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null || launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null
     i=0
     while [[ "$i" -lt 10 ]]; do
@@ -1060,10 +1180,22 @@ EOF
   #    declinable: the persisted no_app preference skips it here and in
   #    upgrades alike.
   if [[ "$(config_get no_app 0)" == 1 ]]; then
-    note_app="declined (no_app=1; lich config no_app 0 to change)"
+    # Declining means not having it — including a copy an earlier install
+    # put there.
+    if [[ -d /Applications/Lich.app ]]; then
+      remove_menubar_app
+      note_app="removed — CLI only (no_app=1; lich config no_app 0 to change)"
+    else
+      note_app="declined (no_app=1; lich config no_app 0 to change)"
+    fi
   else
     case "$(sync_menubar_app "$self"; echo $?)" in
-      0) st_app=ok ;;
+      0) case "$(menubar_verify)" in
+           visible) st_app=ok ;;
+           unknown) st_app=ok note_app="launched (couldn't check the icon — screen locked or asleep)" ;;
+           hidden)  st_app=hidden note_app="running, but the icon is not on screen — see below" ;;
+           *)       st_app=failed note_app="copied, but did not stay running — see below" ;;
+         esac ;;
       1) note_app="no built app found (from a clone: make -C menubar, then re-run)" ;;
       *) st_app=failed note_app="could not copy into /Applications"
          echo "lich: warning: menu bar app: $note_app" >&2 ;;
@@ -1094,9 +1226,13 @@ EOF
     echo "lid-close still sleeps normally. 'lich status' and the flag files"
     echo "work. Fix: an ADMIN adds this rule (works for non-admin users too)"
     echo "with 'sudo visudo -f $SUDOERS':"
-    echo "  $USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1"
-    echo "— then re-run ${C_ACT}lich install${C_OFF} as $USER: no password will be needed."
+    echo "  $LICH_USER ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1"
+    echo "— then re-run ${C_ACT}lich install${C_OFF} as $LICH_USER: no password will be needed."
   fi
+  case "$st_app" in
+    hidden) echo; menubar_help hidden ;;
+    failed) [[ "$note_app" == copied* ]] && { echo; menubar_help not-running; } ;;
+  esac
   echo "(The Control Center toggle is a separate, optional source build — see README.)"
 
   log "cmd: install (sudoers=$st_sudoers link=$st_link flag=$st_flag plist=$st_plist watcher=$st_agent app=$st_app)"
@@ -1113,7 +1249,7 @@ cmd_widget() {
   local arg="${1:-add}" self src tmpdir
   case "$arg" in
     remove)
-      pkill -f LichToggle 2>/dev/null || true
+      pkill -x LichToggle 2>/dev/null || true
       rm -rf /Applications/LichToggle.app
       log "cmd: widget remove"
       echo "Control Center widget removed (macOS may keep a stale gallery entry until next login)"
@@ -1186,7 +1322,10 @@ cmd_upgrade() {
         echo "Clone install — pulling…"
         git -C "$dir" pull --ff-only || die "git pull failed — resolve by hand in $dir"
         # Rebuild the menu bar app if the toolchain is here; fail open if not.
-        command -v swiftc >/dev/null 2>&1 && make -C "$dir/menubar" >/dev/null 2>&1
+        if command -v swiftc >/dev/null 2>&1; then
+          make -C "$dir/menubar" >/dev/null 2>&1 \
+            || echo "lich: warning: menu bar app build failed — continuing with the old one" >&2
+        fi
       else
         die "can't tell how this was installed (not brew, not a git clone) — update by hand"
       fi
@@ -1195,7 +1334,11 @@ cmd_upgrade() {
   if [[ "$(config_get no_app 0)" == 1 ]]; then
     : # CLI-only by choice — never resurrect a declined interface
   elif sync_menubar_app "$self"; then
-    echo "menu bar app refreshed"
+    local icon; icon="$(menubar_verify)"
+    case "$icon" in
+      visible|unknown) echo "menu bar app refreshed" ;;
+      *) menubar_help "$icon" ;;
+    esac
   fi
   if launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null; then
     echo "watcher reloaded — running the new code"
@@ -1237,11 +1380,11 @@ cmd_uninstall() {
   rm -rf "$STATE_DIR"
   # The apps lich put there: the menu bar app (install step 5) and the
   # Control Center widget (`lich widget`), if present.
-  pkill -f lich-menubar 2>/dev/null || true
-  rm -rf /Applications/Lich.app 2>/dev/null || true
-  pkill -f LichToggle 2>/dev/null || true
+  remove_menubar_app
+  pkill -x LichToggle 2>/dev/null || true
   rm -rf /Applications/LichToggle.app 2>/dev/null || true
-  sudo rm -f "$SUDOERS" "$SUDOERS_LEGACY"
+  sudo rm -f "$SUDOERS" "$SUDOERS_LEGACY" \
+    || echo "lich: warning: could not remove $SUDOERS — an admin can: sudo rm $SUDOERS" >&2
   # The PATH entry — but only if WE made it. On an Intel Mac the Homebrew
   # prefix is also /usr/local, so brew's own symlink (which points into the
   # Cellar) lives at this exact path; that one is brew uninstall's to remove.
@@ -1268,23 +1411,26 @@ usage: lich [command]     (bare `lich` = status)
              standing setting below is kept and returns afterward
              roam <N>      trip, bounded: N minutes (45 or 45m)
              roam always   STANDING: unplugged never means sleep
-             roam timer    STANDING: every unplug gets roam_mins of grace,
-                           then sleep — persists until roam off
-             roam off      clear the standing setting (and any trip)
-             roam off      stop roaming (leaves the risen flag alone)
-             roam status   one bare line: off | once | always | until <epoch>
+             roam timer    STANDING: unplugged, stays awake until nobody has
+                           touched it for roam_mins (any input re-arms it)
+                           — persists until roam off
+             roam off      clear the standing setting (and any trip);
+                           leaves the risen flag alone
+             roam status   one bare line, "<standing> <trip>": standing is
+                           off|always|timer, trip is -|once|until:<epoch>
   done       for agents: clear a once/timed roam now the work is finished.
              Never touches 'always' (the owner's preference, not yours) and
              never lays the lich to rest
-  config     print effective settings as key=value (floor, roam_mins)
+  config     print effective settings as key=value (floor, roam_mins, no_app)
              config floor <5-95>        battery % where roaming ends
              config roam_mins <1-1440>  what 'roam timer' means
   install    one-time setup, prompts for sudo once: sudoers rule scoped to
              two pmset commands, ~/.lich state flag, LaunchAgent watcher,
              /usr/local/bin/lich unless lich is already on PATH, and the
              menu bar app when a built copy is available
-             --no-app   CLI only — skip the menu bar app now and on every
-                        upgrade (persisted; lich config no_app 0 to undo)
+             --no-app   CLI only — remove the menu bar app if present, and
+                        skip it on every upgrade (persisted; lich config
+                        no_app 0 to undo)
   widget     build + add the optional Control Center toggle — needs full
              Xcode and xcodegen; warns and does nothing without them
              widget remove  take it back out
@@ -1310,6 +1456,18 @@ about 5 seconds. Roaming lives beside it in ~/.lich/roam and ~/.lich/config.
 Log: ~/Library/Logs/lich.log
 EOF
 }
+
+# Pasted docs arrive with their comments attached: zsh (the macOS default
+# shell) does NOT treat `#` as a comment at an interactive prompt unless
+# `setopt interactivecomments` is on, so `lich on   # 💀 risen` reaches us as
+# on, #, 💀, risen. Nothing lich takes ever starts with `#`, so everything
+# from the first such word on is a comment the shell forgot to strip.
+args=()
+for a in "$@"; do
+  [[ "$a" == \#* ]] && break
+  args+=("$a")
+done
+set -- ${args[@]+"${args[@]}"}
 
 # Bare `lich` is status — the safe, read-only default.
 case "${1:-status}" in

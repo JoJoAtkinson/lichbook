@@ -1,0 +1,12 @@
+{
+  "name": "lichbook",
+  "description": "Install, drive, and troubleshoot lichbook (the `lich` CLI) so long Claude sessions survive a closed lid, and hand the Mac back when the work is done.",
+  "author": {
+    "name": "Joseph Atkinson",
+    "url": "https://github.com/JoJoAtkinson"
+  },
+  "homepage": "https://github.com/JoJoAtkinson/lichbook",
+  "repository": "https://github.com/JoJoAtkinson/lichbook",
+  "license": "MIT",
+  "keywords": ["macos", "sleep", "keep-awake", "lid-closed", "clamshell", "pmset"]
+}

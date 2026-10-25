@@ -50,8 +50,10 @@ func lich(_ args: [String]) -> (status: Int32, output: String) {
     process.standardOutput = pipe
     process.standardError = pipe
     do { try process.run() } catch { return (127, "lich CLI not found at \(cliPath) — run install first") }
-    process.waitUntilExit()
+    // Drain BEFORE waiting: a child that fills the pipe buffer blocks on
+    // write, and waiting on it first would deadlock both of us.
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
     return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
@@ -132,6 +134,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // repaint it in place. Rebuilt on each open.
     private var menuToggles: [(button: NSButton, isOn: (Snapshot) -> Bool)] = []
     private var statusLineItems: [NSMenuItem] = []
+    private weak var openMenu: NSMenu?
 
     var loginItemEnabled: Bool { SMAppService.mainApp.status == .enabled }
 
@@ -151,6 +154,91 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshAsync()
         }
         autoRegisterLoginItemOnce()
+        // Two looks, a few seconds apart: right after launch (and especially
+        // at login) the menu bar is still laying itself out, so one early
+        // "hidden" reading proves nothing. Hidden twice = really hidden.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.checkIconVisible(final: false)
+        }
+    }
+
+    // ---- is the icon actually on screen? ---------------------------------
+    // A running app is not a visible icon. On other people's Macs the 💀
+    // went missing three ways, none of which this process is told about:
+    // macOS 26's per-app "Allow in the Menu Bar" switch, a notch MacBook
+    // whose menu bar is full (overflow items sit invisibly behind the notch),
+    // and menu bar managers (Bartender, Ice, Hidden Bar). All three leave the
+    // status item's window off screen or occluded, which IS observable.
+    //
+    // The verdict goes to ~/.lich/menubar-icon ("visible" | "hidden" |
+    // "unknown") for `lich install` to read and explain in the terminal —
+    // and, when hidden, to an alert here, for people who launched the app
+    // from Finder and are looking at no terminal at all.
+    static let iconStateFile = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".lich/menubar-icon")
+
+    func checkIconVisible(final: Bool) {
+        // Locked, display asleep, or lid shut with no external screen: the
+        // icon is legitimately unseen, so there is nothing to conclude.
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        let locked = session?["CGSSessionScreenIsLocked"] as? Bool ?? false
+        guard !locked, !NSScreen.screens.isEmpty else {
+            writeIconState("unknown")
+            return
+        }
+        // No window at all, with an unlocked screen to put it on, counts as
+        // hidden: that may be exactly what a switched-off item looks like.
+        var onScreen = false
+        if let window = statusItem.button?.window {
+            let frame = window.frame
+            onScreen = statusItem.isVisible
+                && window.occlusionState.contains(.visible)
+                && NSScreen.screens.contains { $0.frame.intersects(frame) }
+        }
+        if onScreen {
+            writeIconState("visible")
+        } else if !final {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.checkIconVisible(final: true)
+            }
+        } else {
+            writeIconState("hidden")
+            explainHiddenIcon()
+        }
+    }
+
+    func writeIconState(_ state: String) {
+        try? (state + "\n").write(to: Self.iconStateFile, atomically: true, encoding: .utf8)
+    }
+
+    // Same three causes, same order, as `lich install` prints them — keep the
+    // two in step. Suppressible, because a user who hides the icon on purpose
+    // (and drives lich from the CLI) must not be nagged at every login.
+    func explainHiddenIcon() {
+        let key = "suppressHiddenIconAlert"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Lich is running, but its 💀 isn't visible in your menu bar"
+        alert.informativeText = """
+            Usually one of these is hiding it:
+
+            • System Settings → Menu Bar → "Allow in the Menu Bar": turn Lich on.
+            • A MacBook with a notch and a full menu bar: the icon is behind \
+            the notch. Quit a few menu bar apps, or hold ⌘ and drag icons \
+            out of the bar to make room.
+            • A menu bar manager (Bartender, Ice, Hidden Bar…): reveal Lich there.
+
+            Then quit and reopen Lich. Nothing else depends on the icon — in \
+            Terminal, `lich status`, `lich on` and `lich off` do everything \
+            the menu does.
+            """
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Don't show this again"
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        if alert.suppressionButton?.state == .on {
+            UserDefaults.standard.set(true, forKey: key)
+        }
     }
 
     // Login-item handling, via SMAppService (the modern replacement for
@@ -189,6 +277,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if statusLineItems.count == snap.statusLines.count {
             for (item, line) in zip(statusLineItems, snap.statusLines) {
                 item.title = line
+            }
+        } else if let menu = openMenu {
+            // `lich status` grows and shrinks (blocker lines, notes come and
+            // go), so swap the whole status block rather than leave it stale.
+            for item in statusLineItems { menu.removeItem(item) }
+            statusLineItems = snap.statusLines.enumerated().map { i, line in
+                let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+                menu.insertItem(item, at: i)
+                return item
             }
         }
     }
@@ -270,6 +367,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menuToggles.removeAll()
         statusLineItems.removeAll()
         let menu = NSMenu()
+        openMenu = menu
 
         // Status lines from the cached snapshot — repainted in place moments
         // later by the async refresh kicked below.
@@ -294,7 +392,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         addToggle(to: menu, title: "Stay awake unplugged — always",
                   isOn: { $0.roam.standing == .always },
                   action: #selector(alwaysToggled(_:)))
-        addToggle(to: menu, title: "Stay awake unplugged — \(cache.mins) min each time",
+        addToggle(to: menu, title: "Stay awake unplugged — until idle \(cache.mins) min",
                   isOn: { $0.roam.standing == .timer },
                   action: #selector(timerToggled(_:)))
 
@@ -330,6 +428,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // No main.swift, no @main: this is a script-style top-level entry point, which
 // is what lets the whole app be a single file compiled by swiftc.
 // .accessory = menu bar only — no Dock tile, no menu bar menus of its own.
+// `lich-menubar --unregister-login-item`: drop the login item and exit, without ever
+// putting up an icon. `lich install --no-app` and `lich uninstall` call this
+// before deleting the bundle, so System Settings isn't left holding a login
+// item that points at nothing.
+if CommandLine.arguments.contains("--unregister-login-item") {
+    try? SMAppService.mainApp.unregister()
+    exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

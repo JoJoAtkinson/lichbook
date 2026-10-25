@@ -13,25 +13,48 @@ it has a battery floor.)
 
 ## Install
 
+Paste the whole block into Terminal. It's one command chained with `&&`,
+so it's safe to copy exactly as it is, and it stops at the first step that
+fails:
+
 ```sh
-brew tap jojoatkinson/lichbook https://github.com/JoJoAtkinson/lichbook
-brew trust jojoatkinson/lichbook   # third-party taps need explicit trust
-brew install lichbook              # builds the menu bar app on your machine
-lich install                       # one-time privileged setup; sudo prompts once
-lich on                            # 💀 risen
+brew tap jojoatkinson/lichbook https://github.com/JoJoAtkinson/lichbook &&
+brew trust jojoatkinson/lichbook &&
+brew install lichbook &&
+lich install &&
+lich on
 ```
+
+| Step | What it does |
+|------|--------------|
+| `brew tap …` | adds this repo as a Homebrew tap |
+| `brew trust …` | third-party taps need explicit trust before brew will load them |
+| `brew install lichbook` | installs the CLI and builds the menu bar app on your machine |
+| `lich install` | one-time privileged setup. **Asks for your password once** |
+| `lich on` | 💀 risen |
 
 That's it. Close the lid on a docked Mac and Claude Code sessions, `claude
 remote-control`, ssh sessions, and long jobs keep going.
 
+**Don't see the 💀 in your menu bar?** `lich install` checks and tells you
+which of the usual suspects is hiding it: macOS 26's System Settings → Menu
+Bar → "Allow in the Menu Bar", a full menu bar behind the notch, or a menu
+bar manager like Bartender or Ice. lich works fine without the icon.
+
+**Using Claude Code?** There's an official skill. Install it with
+`/plugin marketplace add JoJoAtkinson/lichbook` and then
+`/plugin install lichbook@lichbook`, or just tell Claude: *"install the skill
+at https://github.com/JoJoAtkinson/lichbook/blob/main/skills/lichbook/SKILL.md"*.
+After that, Claude can install lichbook for you, keep the Mac awake for long
+jobs, and hand it back when it's done. See [For AI agents](#for-ai-agents).
+
 ## Use
 
-```sh
-lich          # status: risen or at rest, power source, sleep setting,
-              #         watcher health, roam mode, battery vs. floor
-lich on       # 💀 risen — lid-close keeps the Mac awake while on AC
-lich off      # ⚰️ at rest — normal sleep
-```
+| Command | What it does |
+|---------|--------------|
+| `lich` | status: risen or at rest, power source, sleep setting, watcher health, roam mode, battery vs. floor |
+| `lich on` | 💀 risen: lid-close keeps the Mac awake while on AC |
+| `lich off` | ⚰️ at rest: normal sleep |
 
 Both states persist across logins. Updating is one word — it detects whether
 you installed via brew or a clone, updates accordingly, refreshes the menu
@@ -68,21 +91,22 @@ floor that ends it before your battery pays for it.
 Roaming has two layers, so a one-off never costs you your default:
 
 - **Standing settings** persist until you change them: `always` (unplugged
-  never means sleep) or `timer` (**every** unplug gets `roam_mins` of grace —
-  30 min out of the box — then sleep; the next unplug gets a fresh window).
+  never means sleep) or `timer` (unplugged, it stays awake until nobody has
+  touched it for `roam_mins`, 30 min out of the box, then sleeps. The
+  countdown starts when you stop using it, not when you unplug, and any
+  keypress or trackpad touch starts it over).
 - **Trips** are temporary overlays: `roam` (until you next plug in) or
   `roam 45` (a bounded window). When a trip is spent or expires, it
   evaporates — and your standing setting is simply back, untouched.
 
-```sh
-lich roam           # TRIP: stay awake unplugged until you plug back in
-lich roam 45        # TRIP: for 45 minutes (45m works too)
-lich roam always    # STANDING: every unplug, from now on
-lich roam timer     # STANDING: roam_mins of grace at every unplug, forever
-lich roam off       # clear the standing setting (and any trip)
-lich roam status    # machine-readable: "<standing> <trip>", e.g. "timer -",
-                    # "off once", "timer until:<epoch>"
-```
+| Command | Kind | What it does |
+|---------|------|--------------|
+| `lich roam` | trip | stay awake unplugged until you plug back in |
+| `lich roam 45` | trip | for 45 minutes (`45m` works too) |
+| `lich roam always` | standing | every unplug, from now on |
+| `lich roam timer` | standing | unplugged, stay awake until `roam_mins` without use, forever |
+| `lich roam off` | | clear the standing setting (and any trip) |
+| `lich roam status` | | machine-readable `<standing> <trip>`, e.g. `timer -`, `off once`, `timer until:<epoch>` |
 
 Every arming form also raises the lich, so one command is enough from a cold
 start.
@@ -91,7 +115,7 @@ start.
 |---------|-------|----------------------|
 | `roam` / `roam 45` | this trip / this window | **kept** — returns when the trip ends |
 | `roam always` | until `roam off` | *is* the setting |
-| `roam timer` | 30 min per unplug, every unplug | *is* the setting |
+| `roam timer` | until 30 min idle, every time you're unplugged | *is* the setting |
 
 `lich roam status` is what the menu bar app parses — one bare line, no
 decoration. `lich status` says the same thing in English, plus the battery
@@ -104,9 +128,9 @@ override flag.** Not even `always` outranks it; that's the whole point of
 having it, and a machine that will run itself flat in a bag is a worse tool
 than one that sleeps.
 
-- A `once` or timed roam that hits the floor is **canceled** — the setting
-  goes back to `off` and the log says why. Plug in, and re-arm it if you
-  still want it.
+- A `once` or timed roam (a trip) that hits the floor is **canceled**: the
+  trip is cleared, your standing setting is kept, and the log says why. Plug
+  in, and re-arm it if you still want it.
 - `always` is **suspended**, not cleared: your standing preference survives
   the low battery and takes effect again once you're back above the floor.
 
@@ -115,11 +139,11 @@ within ~5 seconds of crossing it — lid open or closed.
 
 ### Config
 
-```sh
-lich config                 # print the effective config, defaults included
-lich config floor 15        # battery floor, percent (5–95)
-lich config roam_mins 45    # what `lich roam timer` means, minutes (1–1440)
-```
+| Command | What it does |
+|---------|--------------|
+| `lich config` | print the effective config, defaults included |
+| `lich config floor 15` | battery floor, percent (5–95) |
+| `lich config roam_mins 45` | what `lich roam timer` means, minutes (1–1440) |
 
 Values live in `~/.lich/config` as plain `key=value` lines. No file, or a
 missing key, means the default (`floor=20`, `roam_mins=30`); anything else in
@@ -138,6 +162,10 @@ That clears a **trip** (a `once` or bounded roam) so an unplugged Mac is
 free to sleep again. It deliberately does **not** touch the standing setting
 (`always` or `timer` — the owner's preference, not yours to spend) and does
 **not** lay the lich to rest — `lich off` stays a human decision.
+
+The [lichbook skill](skills/lichbook/SKILL.md) teaches Claude Code all of
+this, including how to install lichbook itself (Claude runs everything except
+the one `lich install` password prompt, which it hands to you).
 
 ---
 
@@ -194,8 +222,9 @@ The risen state is just a flag file, `~/.lich/desired-state`, containing `on`
 or `off`. The CLI, the menu bar app, and the Control Center toggle all flip
 the same flag; the watcher applies it within ~5 seconds. Anything else that
 can write a file — Shortcuts, ssh, cron — controls it the same way. Roaming
-is the same idea: `~/.lich/roam` holds `off`, `once`, `always`, or
-`until <epoch>`, and `~/.lich/config` holds the `floor` and `roam_mins`
+is the same idea: `~/.lich/roam` holds the standing setting (`off`,
+`always`, or `timer`), optionally followed by a trip (`once` or
+`until <epoch>`), and `~/.lich/config` holds the `floor` and `roam_mins`
 settings. The watcher owns those files too — it's what clears a spent
 one-shot, an expired timer, or a roam that hit the floor.
 
@@ -229,9 +258,10 @@ and launches it. From a clone, `make -C menubar` first, then `lich install`
 picks it up the same way. If the build isn't there, install just says so and
 everything else works — the app is optional.
 
-**Prefer CLI only?** `lich install --no-app` skips the menu bar app — and
-the choice is persisted, so `lich upgrade` never resurrects an interface
-you declined. Change your mind later with `lich config no_app 0` and re-run
+**Prefer CLI only?** `lich install --no-app` removes the menu bar app if
+it's there (login item included) and skips it from then on. The choice is
+persisted, so `lich upgrade` never resurrects an interface you declined.
+`lich config no_app 1` does the same. Change your mind later with `lich config no_app 0` and re-run
 `lich install`.
 
 The icon is a status light — 💀 risen, ⚰️ at rest — and any click opens the
@@ -246,9 +276,9 @@ The roaming checkboxes, in plain English:
 - **Stay awake unplugged — this once** — a trip; unticking it (or plugging
   back in) returns you to your standing setting below
 - **Stay awake unplugged — always** — standing setting
-- **Stay awake unplugged — N min each time** — standing setting: every
-  unplug gets N minutes of grace (N is your configured `roam_mins`, read
-  live, so the label shows the real number)
+- **Stay awake unplugged — until idle N min** — standing setting: unplugged,
+  it stays awake until nobody has touched it for N minutes (N is your
+  configured `roam_mins`, read live, so the label shows the real number)
 
 The two standing settings are mutually exclusive; the trip rides on top of
 either. Durations are set with `lich config roam_mins` and nowhere else —
@@ -264,10 +294,10 @@ macOS 26+, and the one piece with a heavyweight toolchain: **full Xcode**
 (Command Line Tools are not enough) plus `brew install xcodegen`. It is never
 installed unasked:
 
-```sh
-lich widget          # builds on your machine, installs, launches
-lich widget remove   # takes it back out
-```
+| Command | What it does |
+|---------|--------------|
+| `lich widget` | builds on your machine, installs, launches |
+| `lich widget remove` | takes it back out |
 
 Without the toolchain, `lich widget` warns you exactly what's missing and
 does nothing. (From a clone, `controlcenter/build.sh` is the same build by

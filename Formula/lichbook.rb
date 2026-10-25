@@ -5,11 +5,9 @@ class Lichbook < Formula
   sha256 "df270c04de5e2edf3f158cf282b1f0b094be385009e38da8f9cff2b97e46847b"
   license "MIT"
 
-  # The formula ships the CLI and nothing else. The menu bar app (menubar/) and
-  # the Control Center control (controlcenter/) are Swift app bundles that need
-  # a full Xcode toolchain, code signing, and — for the login item and the
-  # widget registration — to be launched by the user from /Applications. None of
-  # that survives a `brew install`, so they stay build-from-source. See the repo.
+  # The formula ships the CLI and builds the menu bar app (Command Line Tools
+  # suffice). The Control Center control (controlcenter/) needs full Xcode, so
+  # only its sources ship here, for `lich widget` to build on request.
   def install
     bin.install "lich"
     # Build the menu bar app HERE, on the user's machine — an ad-hoc signature
@@ -36,31 +34,27 @@ class Lichbook < Formula
   # (one password prompt) and a per-user LaunchAgent bootstrapped into a live
   # GUI session — neither is something brew can or should do on the user's
   # behalf. So `lich install` asks for consent once, and this text points at it.
-  # Keep it short: it prints on every install and upgrade.
+  # Keep it short: it prints on every install and upgrade. And keep every
+  # command copy-safe: no inline `# comments` — zsh's interactive default
+  # passes them to the command as arguments.
   def caveats
     <<~EOS
       First-time setup, two steps — nothing works until you run them:
 
-        1. \e[1;33mlich install\e[0m    # one-time; ONE sudo prompt. Adds a sudoers rule
-                           # scoped to exactly two pmset commands, plus a
-                           # per-user watcher process.
-        2. \e[1;33mlich on\e[0m         # 💀 risen: lid-close no longer sleeps this Mac
-                           # while it's plugged in and you're logged in
+        \e[1;33mlich install && lich on\e[0m
 
-      Everyday use:
-        lich               # status: risen/at rest, power, sleep, watcher health
-        lich off           # ⚰️ back to normal sleep
+      lich install is one-time and asks for your password ONCE: it adds a
+      sudoers rule scoped to exactly two pmset commands, plus a per-user
+      watcher process, and puts the menu bar app (💀 status + controls),
+      built just now on this machine, in /Applications. lich on raises it:
+      lid-close no longer sleeps this Mac while it's plugged in and you're
+      logged in. Unplugging, logging out, or lich off ALWAYS restores
+      normal sleep.
 
-      Unplugging, logging out, or `lich off` ALWAYS restores normal sleep.
-
-      lich install also puts the menu bar app (💀 status + controls) in
-      /Applications, built just now on this machine.
-
-      Optional Control Center toggle (needs full Xcode):  lich widget
-      To update everything later, one word:  lich upgrade
-
-      Optional menu bar skull + Control Center toggle build from source:
-        https://github.com/JoJoAtkinson/lichbook
+      Everyday use: lich (status), lich on, lich off.
+      Update everything later: lich upgrade
+      Optional Control Center toggle (needs full Xcode): lich widget
+      Claude Code skill: /plugin marketplace add JoJoAtkinson/lichbook
     EOS
   end
 
